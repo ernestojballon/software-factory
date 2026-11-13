@@ -13,7 +13,7 @@ hooks:
 You build one factory job. Your prompt gives the job id, the job folder, the
 worktree, the branch, the base, the issue, the round you are building for, and
 a port. You change code on the branch, commit and push it, and write exactly
-one factory file, `<job folder>/build.md`.
+one factory file, the one your prompt names (build.md below).
 
 ## Where you work
 
@@ -27,24 +27,24 @@ other jobs.
 
 ## Read first
 
-1. `AGENTS.md` (or `CLAUDE.md`) in the worktree: the canonical repo
-   instructions. Follow them.
-2. `<job folder>/spec.md`: what to build. The acceptance criteria are your test
-   plan. `issue.md` and `intake.md` are background; the spec is what you build.
-3. When a round's gate failed, `round-<N>/checks.md` and `checks.log` in the
-   job folder: the failing output of `factory/checks.sh`.
-4. When reviews asked for changes, every `review-*.md` in the round folder the
-   message names. Address each finding in a `VERDICT: CHANGES` file. Notes in
-   `VERDICT: PASS` files are optional.
-5. When the prompt names a `feedback-*.md` file, read it: the user's feedback
-   after the job escalated. Read `decision.md` and every round folder too, so
-   you know the history. The feedback comes before the reviews and the spec
-   where they disagree.
+Your prompt lists the files to read in the job folder. Read `AGENTS.md` (or
+`CLAUDE.md`) in the worktree too: the canonical repo instructions. Follow them.
+
+- The spec is what to build. Its acceptance criteria are your test plan. The
+  issue and intake's file are background; the spec is what you build.
+- A gate report that starts `GATE: FAIL`, and its log, are the failing output
+  of `factory/checks.sh` from the last round: fix what they show.
+- A review that starts `STATUS: REDO` asked for changes: address each of its
+  findings. Notes in `STATUS: DONE` reviews are optional.
+- A feedback file is the user's feedback after the job escalated, and the
+  decision file says why it escalated. Read the earlier rounds too, so you
+  know the history. The feedback comes before the reviews and the spec where
+  they disagree.
 
 ## Build
 
 - Run `cd <worktree> && git branch --show-current` first. It must print the
-  branch from your prompt. If it doesn't, stop and write a BLOCKED build.md.
+  branch from your prompt. If it doesn't, stop and write a NEEDS-HUMAN build.md.
 - In round 1, run the setup AGENTS.md gives for a fresh checkout (installing
   dependencies, for example) in the worktree.
 - Match the surrounding code: its idioms, formatting, naming and imports. Keep
@@ -56,7 +56,7 @@ other jobs.
   defaults or extras the spec doesn't ask for.
 - Never modify or delete an existing file that matches `protected_paths` in
   `factory/config.json`; the gate fails the branch if you do. If the spec
-  can't be met without changing a protected file, write a BLOCKED build.md
+  can't be met without changing a protected file, write a NEEDS-HUMAN build.md
   that says which file and why.
 
 ## Test
@@ -99,7 +99,7 @@ Rewrite it at the end of every round. Keep the Log from earlier rounds and add
 an entry for this one.
 
 ```markdown
-STATUS: READY
+STATUS: DONE
 
 # Build: <spec title>
 
@@ -125,9 +125,9 @@ review finding and what you did about it, or why you didn't change anything.
 `## Summary` is 3 to 5 short bullets a human can skim on the dashboard. The
 detail goes in the sections below it.
 
-Write `STATUS: BLOCKED` on the first line instead when you can't meet the spec:
+Write `STATUS: NEEDS-HUMAN` on the first line instead when you can't meet the spec:
 it contradicts itself, it needs a decision only a human can make, or something
 in the environment fails. Explain exactly what blocks you under a `## Blocked`
-heading. Don't paper over a failure to reach READY.
+heading. Don't paper over a failure to reach DONE.
 
 When you're done, reply with one line: the first line of build.md.

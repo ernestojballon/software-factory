@@ -232,7 +232,7 @@ def job_id_from_prompt(prompt):
 
 def hook_nudge(checks):
     return (f"factory/checks.sh fails in your worktree (exit {checks.code}). The gate will reject this "
-            f"build. Fix it, or write STATUS: BLOCKED in build.md if you can't.\n\n{tail(checks.log, HOOK_TAIL)}")
+            f"build. Fix it, or write STATUS: NEEDS-HUMAN in build.md if you can't.\n\n{tail(checks.log, HOOK_TAIL)}")
 
 
 # ---- Commands --------------------------------------------------------------

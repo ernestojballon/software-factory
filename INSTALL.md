@@ -67,6 +67,8 @@ It must be non-interactive, must not rewrite files (no `--fix`, no
 
 **`factory/config.json`.**
 
+- `stages`: the pipeline. Leave it as it is unless the user asks for a
+  different one; after any change run `factory/bin/job check`.
 - `base_branch`: the default branch.
 - `merge_method`: `merge`, `squash` or `rebase`, one the repo allows
   (`gh api repos/{owner}/{repo} --jq '{allow_merge_commit, allow_squash_merge, allow_rebase_merge}'`).
@@ -79,8 +81,8 @@ It must be non-interactive, must not rewrite files (no `--fix`, no
 - `checks_timeout_seconds`: raise it if the project's checks take longer than
   30 minutes.
 - `ports`: move `base` if the project already uses ports 5100–5199.
-- Leave `concurrency`, `max_rounds`, `routing`, `surface_reviewers` and
-  `prices_usd_per_mtok` as they are unless the user asks.
+- Leave `concurrency`, `max_rounds`, `redo_stage`, `routing`,
+  `surface_reviewers` and `prices_usd_per_mtok` as they are unless the user asks.
 
 **Agents.** The checklists are general on purpose. Tailor them to the stack
 without changing their structure, file names, first-line formats or one-line
@@ -91,7 +93,7 @@ replies:
 - `reviewer-ui.md`: where the design tokens, theme and shared components live.
 - `reviewer-ux.md`: the kinds of users the app has.
 - `approver.md`: what a human must always see in this project, added to the
-  ESCALATE list.
+  escalate list.
 - `intake.md`: one line under **Decide** saying what the project is for, so
   intake can tell what belongs.
 
@@ -109,7 +111,8 @@ Then add a short section:
 
 `/factory run` builds every open GitHub issue labeled `factory` through
 intake → spec → build → gate → review → approve, one PR per issue. State is in
-`factory/jobs/` (gitignored); `factory/bin/job` is its only writer. Checks:
+`factory/jobs/` (gitignored); `factory/bin/job` is its only writer. The
+pipeline's stages are in `factory/config.json`. Checks:
 `factory/checks.sh`. Dashboard: `cd factory && python3 -m http.server --bind 127.0.0.1`, then
 open http://localhost:8000/dashboard.html.
 
@@ -145,7 +148,8 @@ gh label create factory:needs-human --color D93F0B --description "The factory ne
 1. In the project root, on the current branch, `bash factory/checks.sh` exits 0.
    If it fails there, the factory can never pass a job: fix the
    script (not the project) or tell the user what's broken.
-2. `factory/bin/job queue` runs without an error.
+2. `factory/bin/job check` prints `config.json: ok` and `factory/bin/job queue`
+   runs without an error.
 3. Each file in `.claude/agents/` has only these frontmatter keys: `name`,
    `description`, `tools`, `model`, and `hooks` on the builder. Claude Code
    ignores unknown keys without a warning, so a typo silently changes behaviour.

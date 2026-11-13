@@ -30,26 +30,34 @@ You need Claude Code 2.1.257 or later, `python3`, and an authenticated
 issues labeled `factory`
         │
         ▼
-intake (fable) ── NEEDS-INFO → asks the author on the issue, waits for a reply
-        │         REJECT     → says why on the issue, removes the label
-        ▼ ACCEPT, maybe rescoped; rates risk + surfaces
-route (script)    picks reviewers and models from config.json
+intake ── NEEDS-INFO → asks the author on the issue, waits for a reply
+        │  REJECTED   → says why on the issue, removes the label
+        ▼ DONE, maybe rescoped; rates risk + surfaces, which pick the reviewers
+spec-writer → spec.md
         ▼
-spec-writer (opus) → spec.md
-        ▼
-builder (opus) → commits, pushes, opens a draft PR "Closes #n"
+builder → commits, pushes, opens a draft PR "Closes #n"
         ▼            ▲
-gate (script) ─FAIL──┤  factory/checks.sh; no reviewer runs on a failing build
-        ▼ PASS       │
-reviewers ─CHANGES───┘  code (haiku | sonnet), + ux & ui on UI changes, + security
-        ▼ all PASS
-approver (opus) ── APPROVE  → sync with main, gate again, gh pr merge
-                └─ ESCALATE → PR ready for you, issue labeled factory:needs-human
+gate (script) ─REDO──┤  factory/checks.sh; no reviewer runs on a failing build
+        ▼ DONE       │
+reviewers ─REDO──────┘  code, + ux & ui on UI changes, + security
+        ▼ all DONE
+approver ── DONE        → merging: sync with main, gate again, gh pr merge
+         └─ NEEDS-HUMAN → PR ready for you, issue labeled factory:needs-human
 ```
 
+That pipeline is the `stages` list in [`factory/config.json`](factory/config.json):
+each stage names who runs it, the files it reads and the file it writes. Every
+stage ends with one of five statuses on the first line of its file (`DONE`,
+`REDO`, `NEEDS-INFO`, `NEEDS-HUMAN`, `REJECTED`), and `factory/bin/job` moves
+the job by that status. To change the pipeline, edit the list: drop the
+`merging` stage and nothing merges without you; drop `spec` and intake's scope
+goes straight to the builder.
+
 One Claude Code session orchestrates every job, `concurrency` at a time
-(default 3). Each job gets its own git worktree and branch. All state lives in
-`factory/jobs/`, so if the session dies, `/factory run` picks every job back up.
+(default 3). It asks `factory/bin/job next` what to do, spawns the agents and
+runs the commands it prints, and reports back with `factory/bin/job done`. Each
+job gets its own git worktree and branch. All state lives in `factory/jobs/`,
+so if the session dies, `/factory run` picks every job back up.
 
 ## Commands
 
@@ -67,23 +75,25 @@ its author, tell the factory to reject it.
 
 ```
 .claude/
-  skills/factory/SKILL.md     the orchestrator: queue, concurrency, the pipeline
-  agents/
+  skills/factory/SKILL.md     the orchestrator: a loop around `job next` and `job done`
+  agents/                     how each agent works; each file sets its own model and tools
     intake.md                 fable    worth building? at what scope? risk + surfaces
-    spec-writer.md            opus     spec.md
-    builder.md                opus     code, commits, the PR, build.md
+    spec-writer.md            opus     the spec
+    builder.md                opus     code, commits, the PR, its build report
     reviewer-code.md          routed   correctness, simplicity, tests
     reviewer-security.md      opus     only when intake flags `security`
     reviewer-ux.md            sonnet   only when intake flags `ui`
     reviewer-ui.md            haiku    only when intake flags `ui`
-    approver.md               opus     APPROVE or ESCALATE
+    approver.md               opus     merge it, or hand it to you
 factory/
-  config.json                 concurrency, rounds, labels, routing, protected paths, prices
+  config.json                 the pipeline (stages, who runs each, inputs, outputs), limits,
+                              labels, reviewer routing, protected paths, prices
   checks.sh                   your repo's checks (the installer fills it in)
-  bin/job                     the only writer of job.json; refuses illegal moves; merges
+  bin/job                     the engine: reads the pipeline, moves jobs, the only writer of job.json
   bin/gate                    runs checks.sh in a job's worktree → round-N/checks.md
   bin/route                   risk + surfaces → the job's reviewers and models
   dashboard.html              the board
+  tests/                      black-box tests: python3 -B -m unittest discover factory/tests
 examples/jobs/                finished jobs from a real run
 INSTALL.md                    instructions for the installing agent
 DESIGN.md                     how it works and why
@@ -110,8 +120,11 @@ you're billed.
 
 ## The example jobs
 
-They come from a test run on a small private calculator repo, with
-`concurrency: 2` and every agent on Haiku to keep it cheap.
+They come from a test run of an earlier version on a small private calculator
+repo, with `concurrency: 2` and every agent on Haiku to keep it cheap. Their
+files open with that version's verdict words (`DECISION: ACCEPT`,
+`VERDICT: PASS`, `APPROVE`) where today's write a `STATUS:` line; the
+dashboard shows both.
 
 - **001-add-a-subtract-function**: low risk, no UI, so only the code reviewer
   ran. Approved and merged through its PR.

@@ -1,21 +1,31 @@
 #!/usr/bin/env python3
-"""The only writer of factory/jobs/<job-id>/job.json.
+"""The pipeline's engine, and the only writer of factory/jobs/<job-id>/job.json.
 
-Every stage change goes through `advance`, which checks the files that justify
-it and refuses anything else. GitHub side effects that belong to a transition
-(labels, comments, the worktree, the merge) happen here too, so the
-orchestrator never improvises them.
+config.json `stages` lists the pipeline in order: who runs each stage, the
+files it reads and the file it writes. Every stage reports one of five
+statuses, as `STATUS: <status>` on the first line of its file (a script stage
+reports by its exit code: 0 is DONE, 1 is REDO), and one rule moves the job:
+
+  DONE         → the next stage in the list
+  REDO         → back to `redo_stage` for another round; needs-human on the last round
+  NEEDS-INFO   → wait for the issue's author
+  NEEDS-HUMAN  → wait for you
+  REJECTED     → stop
 
 Usage:
-  job queue                      what /factory run should do with each labeled issue
-  job create <issue>             new job for an open `factory` issue; prints the job id
-  job advance <job> <stage>      move a job to <stage>, or refuse
-  job merge <job>                APPROVE → sync with the base branch, gate, merge the PR
-  job feedback <job>             needs-human → build, with your feedback (stdin) as feedback-<k>.md
+  job next [<issue>] [--resume]  start what can start; print what to spawn or run now
+  job done <job>                 an agent finished: read its status and move the job
+  job run <job>                  run the job's script stage (the gate, the merge) and move the job
+  job fail <job>                 a step keeps failing: send the job to needs-human, the error on stdin
+  job feedback <job>             needs-human → another round, with your feedback (stdin) as feedback-<k>.md
   job reject <job>               any unfinished job → rejected, with your reason (stdin) as rejection.md
+  job queue                      every labeled issue and what it waits for
+  job create <issue>             new job for an open `factory` issue; prints the job id
+  job merge <job>                sync with the base branch, gate, merge the PR (the merging stage's script)
   job agents <job> <json>        record the routed agent set (called by factory/bin/route)
   job sync <job>                 refresh reviews, gate and cost from the job's files
   job summary [<job>...]         table of jobs: issue, stage, PR, cost, time
+  job check                      validate config.json and the agent files it names
 
 <job> is a job id (004-dark-mode) or an issue number (12).
 """
@@ -24,6 +34,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -33,27 +44,21 @@ REPO = Path(__file__).resolve().parents[2]
 FACTORY = REPO / "factory"
 JOBS = FACTORY / "jobs"
 BIN = FACTORY / "bin"
+AGENTS_DIR = REPO / ".claude" / "agents"
 CONFIG = json.loads((FACTORY / "config.json").read_text())
 LABELS = CONFIG["labels"]
 BASE = CONFIG["base_branch"]
+CONCURRENCY = CONFIG["concurrency"]
 MARKER = "<!-- factory -->"
 
-TRANSITIONS = {
-    "intake": {"needs-info", "rejected", "spec"},
-    "needs-info": {"intake", "rejected"},
-    "spec": {"build"},
-    "build": {"gate", "needs-human"},
-    "gate": {"review", "build", "needs-human"},
-    "review": {"approve", "build", "needs-human"},
-    "approve": {"merging", "needs-human"},
-    "merging": {"needs-human"},
-    "needs-human": {"build", "rejected"},
-}
-TERMINAL = {"merged", "rejected"}
-# Any unfinished job can move to merged once its PR is merged on GitHub,
-# whether the factory merged it or a person did mid-round.
+STAGES = CONFIG.get("stages", [])
+STAGE = {s.get("name"): s for s in STAGES}
+ORDER = [s.get("name") for s in STAGES]
+REDO_STAGE = CONFIG.get("redo_stage")
 WAITING = {"needs-info", "needs-human"}
-CONCURRENCY = CONFIG["concurrency"]
+TERMINAL = {"merged", "rejected"}
+STATUSES = ("DONE", "REDO", "NEEDS-INFO", "NEEDS-HUMAN", "REJECTED")
+DECISION = "decision.md"  # why a job needs a human; the PR comment is its body
 
 
 class Refused(Exception):
@@ -63,6 +68,11 @@ class Refused(Exception):
 def die(msg):
     print(f"job: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def require(cond, msg):
+    if not cond:
+        raise Refused(msg)
 
 
 def now():
@@ -93,6 +103,108 @@ def operator():
     if _operator is None:
         _operator = gh("api", "user", "--jq", ".login").strip()
     return _operator
+
+
+# ---- The pipeline in config.json -------------------------------------------
+
+
+def config_problems():
+    """What is wrong with the shape of `stages`. The scripts refuse to run until it's empty."""
+    problems = []
+    for index, spec in enumerate(STAGES):
+        name = spec.get("name")
+        where = f"stage {name or index + 1}"
+        if not name:
+            problems.append(f"{where}: needs a name")
+        elif ORDER.count(name) > 1 or name in WAITING | TERMINAL:
+            problems.append(f"{where}: the name is taken")
+        if len([k for k in ("agent", "agents", "script") if k in spec]) != 1:
+            problems.append(f"{where}: needs exactly one of agent, agents, script")
+        if "agent" in spec and not spec["agent"].get("file"):
+            problems.append(f"{where}: agent needs a file")
+        if "agents" in spec and "{agent}" not in spec["agents"].get("routed", ""):
+            problems.append(f"{where}: agents needs routed, a file name with {{agent}} in it")
+        if not spec.get("output"):
+            problems.append(f"{where}: needs an output")
+        elif ("agents" in spec) != ("{agent}" in spec["output"]):
+            problems.append(f"{where}: output has {{agent}} in it exactly when the stage runs routed agents")
+        if not isinstance(spec.get("input", []), list):
+            problems.append(f"{where}: input is a list of files")
+    if not STAGES:
+        problems.append("stages is empty")
+    elif "agent" not in STAGES[0]:
+        problems.append(f"stage {ORDER[0]}: the first stage is run by one agent")
+    if "agent" not in STAGE.get(REDO_STAGE, {}):
+        problems.append(f"redo_stage {REDO_STAGE!r} isn't a stage run by one agent")
+    return problems
+
+
+def is_script(stage):
+    return "script" in STAGE[stage]
+
+
+def is_routed(stage):
+    return "agents" in STAGE[stage]
+
+
+def after(stage):
+    """The next stage in the list, or None after the last."""
+    index = ORDER.index(stage) + 1
+    return ORDER[index] if index < len(ORDER) else None
+
+
+def before_redo(stage):
+    return ORDER.index(stage) < ORDER.index(REDO_STAGE)
+
+
+ROUTED_STAGE = next((name for name in ORDER if is_routed(name)), None)
+MERGE_STAGE = next((name for name in ORDER if is_script(name) and re.search(r"\bjob merge\b", STAGE[name]["script"])), None)
+
+
+def agent_name(file):
+    """What Claude Code calls the agent in .claude/agents/<file>: its frontmatter `name`."""
+    path = AGENTS_DIR / file
+    if path.exists():
+        m = re.search(r"^name:\s*(\S+)", path.read_text(), re.M)
+        if m:
+            return m.group(1)
+    return Path(file).stem
+
+
+def stage_agents(job, stage):
+    """[(key, agent file, model)] for a stage. key is a routed agent's name in
+    job.json `agents`; None, like the model, for a stage's one agent."""
+    spec = STAGE[stage]
+    if "agent" in spec:
+        return [(None, spec["agent"]["file"], None)]
+    require(job["agents"], f"route the job first: factory/bin/route {job['id']}")
+    return [(key, spec["agents"]["routed"].format(agent=key), model)
+            for key, model in job["agents"]["reviewers"].items()]
+
+
+def expand(pattern, job, key=None):
+    return pattern.format(job=job["id"], round=job["round"], prev=job["round"] - 1, agent=key or "")
+
+
+def output_path(job, stage, key=None):
+    return job_dir(job["id"]) / expand(STAGE[stage]["output"], job, key)
+
+
+def input_files(job, stage, key=None):
+    """The stage's `input` entries that exist, relative to the job folder. A
+    plain name must exist; a pattern with `*`, or a name ending in `?`, may not."""
+    d = job_dir(job["id"])
+    own = output_path(job, stage, key)
+    found = []
+    for entry in STAGE[stage].get("input", []):
+        pattern = expand(entry.rstrip("?"), job, key)
+        if "*" in pattern:
+            paths = sorted(p for p in d.glob(pattern) if p.is_file() and p != own)
+        else:
+            paths = [d / pattern] if (d / pattern).exists() else []
+            require(paths or entry.endswith("?"), f"{job['id']}: {stage} needs {pattern}, which doesn't exist")
+        found += [str(p.relative_to(d)) for p in paths if str(p.relative_to(d)) not in found]
+    return found
 
 
 # ---- Job files -------------------------------------------------------------
@@ -169,6 +281,20 @@ def first_line(path):
     return path.read_text().split("\n", 1)[0].strip() if path.exists() else None
 
 
+def body(path):
+    """A stage file without the KEY: value lines it opens with."""
+    lines = path.read_text().splitlines()
+    while lines and re.match(r"[A-Z-]+:\s", lines[0]):
+        lines.pop(0)
+    return "\n".join(lines).strip()
+
+
+def status_of(path):
+    """The status on a stage file's first line, or None when it isn't one."""
+    m = re.fullmatch(r"STATUS:\s*(\S+)", first_line(path) or "")
+    return m.group(1) if m and m.group(1) in STATUSES else None
+
+
 def header(path):
     """KEY: value lines at the top of an agent's file, up to the first blank line."""
     fields = {}
@@ -186,12 +312,8 @@ def section(path, heading):
     return m.group(1).strip() if m else None
 
 
-def round_dir(job, n=None):
-    return job_dir(job["id"]) / f"round-{n or job['round']}"
-
-
-def reviewers(job):
-    return list(job["agents"]["reviewers"])
+def relative(path):
+    return str(path.relative_to(job_dir(path.relative_to(JOBS).parts[0])))
 
 
 # ---- Issue → issue.md ------------------------------------------------------
@@ -228,8 +350,8 @@ def write_issue_md(job):
         lines += ["", "## Comments"]
         for c in comments:
             who = "factory" if c["body"].startswith(MARKER) else f"@{c['author']['login']}"
-            body = c["body"].removeprefix(MARKER)
-            lines += ["", f"### {who}, {c['createdAt']}", "", quote(body)]
+            text = c["body"].removeprefix(MARKER)
+            lines += ["", f"### {who}, {c['createdAt']}", "", quote(text)]
     (job_dir(job["id"]) / "issue.md").write_text("\n".join(lines) + "\n")
     return issue
 
@@ -246,9 +368,9 @@ def replied_since_question(issue):
     return replied
 
 
-def comment(kind, number, body):
+def comment(kind, number, text):
     """Post a factory comment, unless it is already the last one (a retried transition)."""
-    text = f"{MARKER}\n{body}"
+    text = f"{MARKER}\n{text}"
     posted = gh_json(kind, "view", str(number), "--json", "comments")["comments"]
     if posted and posted[-1]["body"].replace("\r\n", "\n").strip() == text.strip():
         return
@@ -336,42 +458,30 @@ def cost_usd(job):
 
 
 def sync(job):
-    d = job_dir(job["id"])
-    intake = d / "intake.md"
-    if intake.exists():
-        h = header(intake)
+    first = output_path(job, ORDER[0])
+    if first.exists():
+        h = header(first)
         job["intake"] = {
-            "decision": h.get("DECISION"),
+            "status": h.get("STATUS"),
             "rescoped": h.get("RESCOPED") == "yes",
             "risk": h.get("RISK"),
             "surfaces": [s.strip() for s in h.get("SURFACES", "").split(",")
                          if s.strip() and s.strip() != "none"],
         }
     if job["round"]:
-        rd = round_dir(job)
-        gate = header(rd / "checks.md").get("GATE") if (rd / "checks.md").exists() else None
-        job["gate"] = gate
-        if job["agents"] and job["stage"] in {"review", "approve", "merging", "merged", "needs-human"}:
+        checks = output_path(job, "gate") if "gate" in STAGE else None
+        job["gate"] = header(checks).get("GATE") if checks and checks.exists() else None
+        reviewed = job["stage"] not in STAGE or (ROUTED_STAGE and not ORDER.index(job["stage"]) < ORDER.index(ROUTED_STAGE))
+        if ROUTED_STAGE and job["agents"] and reviewed:
             job["reviews"] = {}
-            for r in reviewers(job):
-                line = first_line(rd / f"review-{r}.md")
-                m = re.fullmatch(r"VERDICT:\s*(PASS|CHANGES)", line or "")
-                job["reviews"][r] = m.group(1) if m else ("pending" if line is None else "invalid")
+            for key, _, _ in stage_agents(job, ROUTED_STAGE):
+                path = output_path(job, ROUTED_STAGE, key)
+                job["reviews"][key] = status_of(path) or ("pending" if not path.exists() else "invalid")
     job["cost_usd"] = cost_usd(job)
     return job
 
 
-# ---- Transitions -----------------------------------------------------------
-
-
-def require(cond, msg):
-    if not cond:
-        raise Refused(msg)
-
-
-def escalate(job, why):
-    """Write decision.md for an escalation the approver didn't make."""
-    (job_dir(job["id"]) / "decision.md").write_text(f"ESCALATE\n\n## Why\n{why}\n")
+# ---- Moving a job ----------------------------------------------------------
 
 
 def git(job, *args, check=True):
@@ -382,164 +492,195 @@ def pr_state(job):
     return gh_json("pr", "view", str(job["pr"]), "--json", "state")["state"]
 
 
-def check_reviews_done(job):
-    rd = round_dir(job)
-    missing = [r for r in reviewers(job) if not (rd / f"review-{r}.md").exists()]
-    require(not missing, f"round {job['round']} is missing reviews from: {', '.join(missing)}")
-    bad = [r for r, v in job["reviews"].items() if v not in {"PASS", "CHANGES"}]
-    require(not bad, f"first line isn't a verdict in review-{bad[0]}.md" if bad else "")
+def move(job, stage):
+    """Every stage change ends here."""
+    if stage in TERMINAL and Path(job["worktree"]).exists():
+        run(["git", "worktree", "remove", "--force", job["worktree"]])
+        run(["git", "branch", "-D", job["branch"]], check=False)
+    if stage not in WAITING:
+        job["waiting_from"] = None
+    job["stage"] = stage
+    job["step"] += 1
+    job["ended"] = now() if stage in TERMINAL | WAITING else None
+    return job
 
 
 def next_round(job):
     job["round"] += 1
-    round_dir(job).mkdir(exist_ok=True)
+    (job_dir(job["id"]) / f"round-{job['round']}").mkdir(exist_ok=True)
     job["gate"] = None
     job["reviews"] = {}
 
 
-def advance(job, stage):
-    old = job["stage"]
-    d = job_dir(job["id"])
-    # `job reject` writes rejection.md; with it, any unfinished job can be rejected.
-    rejecting = stage == "rejected" and (d / "rejection.md").exists()
-    require(stage in TRANSITIONS.get(old, set()) or (old not in TERMINAL and (stage == "merged" or rejecting)),
-            f"{job['id']}: {old} → {stage} is not a legal transition")
-    decision = header(d / "intake.md").get("DECISION") if (d / "intake.md").exists() else None
-    intake_body = lambda: "\n".join((d / "intake.md").read_text().split("\n\n", 1)[1:]).strip()
+def ensure_worktree(job):
+    if not Path(job["worktree"]).exists():
+        run(["git", "fetch", "origin", BASE])
+        Path(job["worktree"]).parent.mkdir(parents=True, exist_ok=True)
+        run(["git", "worktree", "add", "-b", job["branch"], job["worktree"], f"origin/{BASE}"])
 
-    if stage == "merged":
-        require(job["pr"] and pr_state(job) == "MERGED", "the PR isn't merged")
-        if old == "needs-human":
-            label("issue", job["issue"], remove=LABELS["needs_human"])
 
-    elif stage == "rejected" and (rejecting or old in WAITING):
-        require(rejecting, "use `job reject` to reject a waiting job")
-        reason = (d / "rejection.md").read_text().split("\n", 1)[1].strip()
-        comment("issue", job["issue"], f"### Factory: rejected\n\n{reason}")
-        waiting = {"needs-info": LABELS["needs_info"], "needs-human": LABELS["needs_human"]}.get(old)
-        label("issue", job["issue"], remove=",".join(filter(None, [LABELS["queue"], waiting])))
-        if job["pr"]:
-            gh("pr", "close", str(job["pr"]))
-            run(["git", "push", "origin", "--delete", job["branch"]], check=False)
-
-    elif old == "intake":
-        want = {"needs-info": "NEEDS-INFO", "rejected": "REJECT", "spec": "ACCEPT"}[stage]
-        require(decision == want, f"intake.md says DECISION: {decision}, not {want}")
-        title = f"### Factory intake: {decision}"
-        if stage == "spec":
-            require(job["agents"], "route the job first: factory/bin/route " + job["id"])
-            i = job["intake"]
-            title += f" (risk {i['risk']}, surfaces: {', '.join(i['surfaces']) or 'none'})"
-        if stage == "spec" and not Path(job["worktree"]).exists():
-            # Before the comment, so a failure here leaves nothing to repeat on a retry.
-            run(["git", "fetch", "origin", BASE])
-            Path(job["worktree"]).parent.mkdir(parents=True, exist_ok=True)
-            run(["git", "worktree", "add", "-b", job["branch"], job["worktree"], f"origin/{BASE}"])
-        comment("issue", job["issue"], f"{title}\n\n{intake_body()}")
-        if stage == "needs-info":
-            label("issue", job["issue"], add=LABELS["needs_info"])
-        elif stage == "rejected":
-            label("issue", job["issue"], remove=LABELS["queue"])
-
-    elif old == "needs-info":
-        require_slot(job["id"])
-        write_issue_md(job)
-        label("issue", job["issue"], remove=LABELS["needs_info"])
-        k = len(list(d.glob("intake-*.md"))) + 1
-        (d / "intake.md").rename(d / f"intake-{k}.md")
-        job["intake"] = None
-
-    elif old == "spec":
-        require((d / "spec.md").exists(), "spec.md doesn't exist")
+def enter(job, stage):
+    """Start a stage the job reached by passing the one before it."""
+    ensure_worktree(job)
+    if stage == REDO_STAGE and job["round"] == 0:
         next_round(job)
+    return move(job, stage)
 
-    elif old == "build" and stage == "gate":
-        status = first_line(d / "build.md")
-        require(status == "STATUS: READY", f"build.md starts with {status!r}, not STATUS: READY")
-        require(not git(job, "status", "--porcelain").stdout.strip(), "the worktree has uncommitted changes")
-        require(int(git(job, "rev-list", "--count", f"origin/{BASE}..HEAD").stdout) > 0,
-                f"{job['branch']} has no commits on top of origin/{BASE}")
-        git(job, "fetch", "origin", job["branch"], check=False)
-        head = git(job, "rev-parse", "HEAD").stdout.strip()
-        res = git(job, "rev-parse", f"origin/{job['branch']}", check=False)
-        remote = res.stdout.strip() if res.returncode == 0 else ""
-        require(head == remote, f"{job['branch']} isn't pushed: local {head[:7]}, origin {remote[:7] or 'missing'}")
-        if not job["pr"]:
-            prs = gh_json("pr", "list", "--head", job["branch"], "--state", "open", "--json", "number,url")
-            require(len(prs) == 1, f"expected one open PR from {job['branch']}, found {len(prs)}")
-            job["pr"], job["pr_url"] = prs[0]["number"], prs[0]["url"]
 
-    elif old == "build":  # → needs-human
-        status = first_line(d / "build.md")
-        require(status == "STATUS: BLOCKED", f"build.md starts with {status!r}, not STATUS: BLOCKED")
-        escalate(job, "The builder is blocked:\n\n" + (section(d / "build.md", "Blocked") or "(no Blocked section)"))
+def reopen(job, stage):
+    """Send a waiting job back to the stage that parked it. That stage's earlier
+    answer is kept as <name>-<k>.md, so its agent can read what it said before."""
+    out = output_path(job, stage)
+    if out.exists():
+        k = len(list(out.parent.glob(f"{out.stem}-*{out.suffix}"))) + 1
+        out.rename(out.with_name(f"{out.stem}-{k}{out.suffix}"))
+    if stage == ORDER[0]:
+        job["intake"] = job["agents"] = None
+    return move(job, stage)
 
-    elif old == "gate":
-        checks = round_dir(job) / "checks.md"
-        require(checks.exists(), f"run the gate first: factory/bin/gate {job['id']}")
-        h = header(checks)
-        require(h.get("COMMIT") == git(job, "rev-parse", "HEAD").stdout.strip(),
-                "checks.md was written for another commit; run the gate again")
-        if stage == "review":
-            require(h.get("GATE") == "PASS", "the gate didn't pass")
-            job["reviews"] = {r: "pending" for r in reviewers(job)}
-        else:
-            require(h.get("GATE") == "FAIL", "the gate passed")
-            last = job["round"] >= job["round_limit"]
-            require(last == (stage == "needs-human"),
-                    f"round {job['round']} of {job['round_limit']}: go to {'needs-human' if last else 'build'}")
-            if last:
-                escalate(job, f"The gate failed in round {job['round']}, the last allowed round. "
-                              f"See round-{job['round']}/checks.md.")
-            else:
-                next_round(job)
 
-    elif old == "review":
-        check_reviews_done(job)
-        changes = [r for r, v in job["reviews"].items() if v == "CHANGES"]
-        if stage == "approve":
-            require(not changes, f"reviews want CHANGES: {', '.join(changes)}")
-        else:
-            require(changes, "every review passed")
-            last = job["round"] >= job["round_limit"]
-            require(last == (stage == "needs-human"),
-                    f"round {job['round']} of {job['round_limit']}: go to {'needs-human' if last else 'build'}")
-            if last:
-                escalate(job, f"Review rounds exhausted. Outstanding CHANGES in round-{job['round']}/ "
-                              f"from: {', '.join(changes)}.")
-            else:
-                next_round(job)
+def check_pushed(job):
+    """The redo stage is the one that writes code: its work must be on the PR."""
+    require(not git(job, "status", "--porcelain").stdout.strip(), "the worktree has uncommitted changes")
+    require(int(git(job, "rev-list", "--count", f"origin/{BASE}..HEAD").stdout) > 0,
+            f"{job['branch']} has no commits on top of origin/{BASE}")
+    git(job, "fetch", "origin", job["branch"], check=False)
+    head = git(job, "rev-parse", "HEAD").stdout.strip()
+    res = git(job, "rev-parse", f"origin/{job['branch']}", check=False)
+    remote = res.stdout.strip() if res.returncode == 0 else ""
+    require(head == remote, f"{job['branch']} isn't pushed: local {head[:7]}, origin {remote[:7] or 'missing'}")
+    if not job["pr"]:
+        prs = gh_json("pr", "list", "--head", job["branch"], "--state", "open", "--json", "number,url")
+        require(len(prs) == 1, f"expected one open PR from {job['branch']}, found {len(prs)}")
+        job["pr"], job["pr_url"] = prs[0]["number"], prs[0]["url"]
 
-    elif old == "approve":
-        want = "APPROVE" if stage == "merging" else "ESCALATE"
-        line = first_line(d / "decision.md")
-        require(line == want, f"decision.md starts with {line!r}, not {want}")
 
-    elif old == "needs-human":
-        feedback = sorted(d.glob("feedback-*.md"))
-        require(feedback and feedback[-1].stat().st_mtime > (d / "decision.md").stat().st_mtime,
-                "use `job feedback` to send a job back to the builder")
-        job["round_limit"] = job["round"] + CONFIG["max_rounds"]
-        next_round(job)
+def needs_human(job, why=None):
+    """Park the job for you. `why` is written to decision.md unless the stage wrote it itself."""
+    decision = job_dir(job["id"]) / DECISION
+    if why:
+        decision.write_text(f"STATUS: NEEDS-HUMAN\n\n## Why\n{why}\n")
+    text = f"### Factory: needs a human\n\n{body(decision)}"
+    if job["pr"]:
+        if gh_json("pr", "view", str(job["pr"]), "--json", "isDraft")["isDraft"]:
+            gh("pr", "ready", str(job["pr"]))
+        comment("pr", job["pr"], text)
+    else:
+        comment("issue", job["issue"], text)
+    label("issue", job["issue"], add=LABELS["needs_human"])
+    if job["stage"] in STAGE:
+        job["waiting_from"] = job["stage"]
+    return move(job, "needs-human")
+
+
+def rejected(job):
+    waiting = {"needs-info": LABELS["needs_info"], "needs-human": LABELS["needs_human"]}.get(job["stage"])
+    label("issue", job["issue"], remove=",".join(filter(None, [LABELS["queue"], waiting])))
+    if job["pr"]:
+        gh("pr", "close", str(job["pr"]))
+        run(["git", "push", "origin", "--delete", job["branch"]], check=False)
+    return move(job, "rejected")
+
+
+def merged(job):
+    """A job is done once its PR is merged on GitHub, whoever merged it."""
+    require(job["pr"] and pr_state(job) == "MERGED", "the PR isn't merged")
+    if job["stage"] == "needs-human":
         label("issue", job["issue"], remove=LABELS["needs_human"])
+    return move(job, "merged")
 
-    if stage == "needs-human":
-        body = f"### Factory: needs a human\n\n{(d / 'decision.md').read_text().split(chr(10), 1)[1].strip()}"
-        if job["pr"]:
-            if gh_json("pr", "view", str(job["pr"]), "--json", "isDraft")["isDraft"]:
-                gh("pr", "ready", str(job["pr"]))
-            comment("pr", job["pr"], body)
-        else:
-            comment("issue", job["issue"], body)
-        label("issue", job["issue"], add=LABELS["needs_human"])
 
-    if stage in TERMINAL and Path(job["worktree"]).exists():
-        run(["git", "worktree", "remove", "--force", job["worktree"]])
-        run(["git", "branch", "-D", job["branch"]], check=False)
+def apply(job, status, source=None, who=None, asking=()):
+    """The one rule: move a job by the status its stage reported.
 
-    job["stage"] = stage
-    job["ended"] = now() if stage in TERMINAL | WAITING else None
-    return job
+    source is the file that carries the status, who the agent that wrote it,
+    and asking the routed agents that asked for REDO."""
+    stage = job["stage"]
+    title = f"### Factory {stage}"
+    if status == "DONE":
+        if stage == REDO_STAGE:
+            check_pushed(job)
+        if after(stage):
+            ensure_worktree(job)  # before any comment, so a failure here leaves nothing to repeat on a retry
+        if stage == ORDER[0]:
+            i = job["intake"]
+            comment("issue", job["issue"],
+                    f"{title}: accepted (risk {i['risk']}, surfaces: {', '.join(i['surfaces']) or 'none'})\n\n{body(source)}")
+        if after(stage):
+            return enter(job, after(stage))
+        if job["pr"] and pr_state(job) == "MERGED":
+            return merged(job)
+        return needs_human(job, "Every stage passed. Merge the PR to finish the job.")
+    if status == "REDO":
+        require(not before_redo(stage) and stage != REDO_STAGE,
+                f"{stage} can't ask for REDO: it doesn't come after {REDO_STAGE}")
+        if job["round"] >= job["round_limit"]:
+            n = job["round"]
+            if asking:
+                return needs_human(job, f"Rounds exhausted. Outstanding REDO in round-{n}/ from: {', '.join(asking)}.")
+            return needs_human(job, f"The {stage} failed in round {n}, the last allowed round. See {relative(source)}.")
+        next_round(job)
+        return move(job, REDO_STAGE)
+    if status == "NEEDS-INFO":
+        comment("issue", job["issue"], f"{title}: needs info\n\n{body(source)}")
+        label("issue", job["issue"], add=LABELS["needs_info"])
+        job["waiting_from"] = stage
+        return move(job, "needs-info")
+    if status == "NEEDS-HUMAN":
+        if source.name == DECISION:
+            return needs_human(job)
+        reason = section(source, "Blocked") or section(source, "For the human") or body(source) or "(no reason given)"
+        return needs_human(job, f"The {who} is blocked:\n\n{reason}")
+    comment("issue", job["issue"], f"{title}: rejected\n\n{body(source)}")
+    return rejected(job)
+
+
+# ---- next: what to spawn or run --------------------------------------------
+
+
+def port(job, index):
+    ports = CONFIG["ports"]
+    return ports["base"] + ports["step"] * int(job["id"].split("-")[0]) + index
+
+
+def prompt(job, stage, key, index, resume):
+    d = job_dir(job["id"])
+    reads = "\n".join(f"- {name}" for name in input_files(job, stage, key))
+    where = f"Stage: {stage}" + (f", round {job['round']}" if job["round"] else "")
+    return (
+        f"Job: {job['id']}. Job folder: {d}/. Main checkout: {REPO}. Worktree: {job['worktree']}. "
+        f"Branch: {job['branch']}. Base: origin/{BASE}. Issue: #{job['issue']}."
+        + (f" PR: #{job['pr']}." if job["pr"] else "") + "\n"
+        f"{where}. Port: {port(job, index)}.\n"
+        + ("An earlier session started this stage: see what it left before you redo any work.\n" if resume else "")
+        + f"\nRead, in the job folder:\n{reads}\n"
+        f"\nWrite, in the job folder: {relative(output_path(job, stage, key))}\n"
+        "Start it with the STATUS line your instructions describe.\n"
+    )
+
+
+def action(job, resume=False):
+    """What the orchestrator does for a job now, as text it can follow to the letter."""
+    stage, job_id = job["stage"], job["id"]
+    lines = [f"=== {job_id}: {stage}" + (f", round {job['round']}" if job["round"] else "") + f" (issue #{job['issue']})"]
+    if is_script(stage):
+        return "\n".join(lines + [f"run in the background: factory/bin/job run {job_id}", ""])
+    for index, (key, file, model) in enumerate(stage_agents(job, stage)):
+        if resume and is_routed(stage) and output_path(job, stage, key).exists():
+            continue  # this reviewer finished before the session died
+        name = agent_name(file)
+        lines.append(f"spawn agent: {name}")
+        if model:
+            lines.append(f"model: {model}")
+        if stage == REDO_STAGE:
+            lines.append(f"name: {name}-{job_id}   (if this session already spawned it, send it the prompt instead)")
+        lines += ["prompt:", "<<<", prompt(job, stage, key, index, resume).rstrip("\n"), ">>>"]
+    if len(lines) == 1:
+        lines.append(f"every agent already finished; run now: factory/bin/job done {job_id}")
+    else:
+        lines.append(f"when {'each one' if is_routed(stage) else 'it'} finishes: factory/bin/job done {job_id}")
+    lines.append("")
+    return "\n".join(lines)
 
 
 # ---- Commands --------------------------------------------------------------
@@ -550,20 +691,13 @@ def slugify(title):
     return "-".join(words) or "issue"
 
 
-def cmd_create(number):
+def create(number):
     existing = [j for j in all_jobs() if j["issue"] == int(number)]
-    if existing:
-        die(f"issue #{number} already has job {existing[0]['id']} ({existing[0]['stage']})")
-    try:
-        require_slot(None)
-    except Refused as e:
-        die(str(e))
+    require(not existing, f"issue #{number} already has job {existing[0]['id']} ({existing[0]['stage']})" if existing else "")
+    require_slot(None)
     issue = fetch_issue(number)
-    if issue["state"] != "OPEN":
-        die(f"issue #{number} is {issue['state'].lower()}")
-    if LABELS["queue"] not in {l["name"] for l in issue["labels"]}:
-        die(f"issue #{number} isn't labeled {LABELS['queue']}")
-    JOBS.mkdir(parents=True, exist_ok=True)
+    require(issue["state"] == "OPEN", f"issue #{number} is {issue['state'].lower()}")
+    require(LABELS["queue"] in {l["name"] for l in issue["labels"]}, f"issue #{number} isn't labeled {LABELS['queue']}")
     numbers = [int(p.name.split("-")[0]) for p in JOBS.iterdir() if p.name[:3].isdigit()]
     job_id = f"{max(numbers, default=0) + 1:03d}-{slugify(issue['title'])}"
     job_dir(job_id).mkdir()
@@ -572,25 +706,28 @@ def cmd_create(number):
         "pr": None, "pr_url": None,
         "branch": f"factory/{job_id}",
         "worktree": str(REPO / ".worktrees" / job_id),
-        "stage": "intake", "round": 0, "round_limit": CONFIG["max_rounds"],
+        "stage": ORDER[0], "round": 0, "round_limit": CONFIG["max_rounds"],
+        "step": 0, "handed": None, "waiting_from": None,
         "intake": None, "agents": None, "gate": None, "reviews": {},
         "cost_usd": 0.0, "started": now(), "ended": None,
     }
     write_issue_md(job)
     save(job)
-    print(job_id)
+    return job
 
 
-def cmd_queue():
-    """Rows in the order to start them. `resume` and `new` rows fit in the
-    concurrency slots; the rest show as `hold` until a running job finishes."""
+def triage():
+    """One row per labeled issue or unfinished job: (action, issue, job id, stage, note).
+
+    `resume` and `new` rows fit in the concurrency slots; the rest show as
+    `hold` until a running job finishes. Jobs whose PR was merged on GitHub
+    are marked merged on the way."""
     jobs = {j["issue"]: j for j in all_jobs()}
-    # A job is done once its PR is merged on GitHub, which also closes the issue.
     for n, j in sorted(jobs.items(), key=lambda item: item[1]["id"]):
         if j["stage"] not in TERMINAL and j["pr"] and pr_state(j) == "MERGED":
             j = load(j["id"])
             if j["stage"] not in TERMINAL:
-                save(advance(sync(j), "merged"))
+                save(merged(sync(j)))
             jobs[n] = j
     issues = gh_json("issue", "list", "--label", LABELS["queue"], "--state", "open",
                      "--limit", "200", "--json", "number,title")
@@ -617,7 +754,8 @@ def cmd_queue():
             running_rows.append(("resume", n, j["id"], j["stage"], f"round {j['round']}"))
     for n, j in sorted(jobs.items()):
         if n not in open_numbers and j["stage"] not in TERMINAL | WAITING:
-            other_rows.append(("skip", n, j["id"], j["stage"], f"issue is closed or no longer labeled {LABELS['queue']}; holds a slot until the job is rejected"))
+            other_rows.append(("skip", n, j["id"], j["stage"],
+                               f"issue is closed or no longer labeled {LABELS['queue']}; holds a slot until the job is rejected"))
     # Jobs already in a running stage hold a slot whether or not an agent is on them.
     slots = CONCURRENCY - len(running(jobs.values()))
     rows = list(running_rows)
@@ -627,35 +765,157 @@ def cmd_queue():
             slots -= 1
         else:
             rows.append(("hold",) + row[1:4] + (f"concurrency {CONCURRENCY} reached",))
-    for row in rows + other_rows:
+    return rows + other_rows
+
+
+def cmd_queue():
+    for row in triage():
         print("\t".join(str(c) for c in row))
+
+
+def cmd_next(only, resume):
+    rows = triage()
+    if only is not None:
+        rows = [row for row in rows if row[1] == only]
+        require(rows, f"issue #{only} isn't an open issue labeled {LABELS['queue']}, and has no unfinished job")
+    notes = []
+    for kind, n, job_id, stage, note in rows:
+        if kind == "new":
+            create(n)
+        elif kind == "resume" and stage == "needs-info":
+            job = sync(load(job_id))
+            require_slot(job_id)
+            write_issue_md(job)
+            label("issue", n, remove=LABELS["needs_info"])
+            save(reopen(job, job["waiting_from"]))
+        elif kind in ("wait", "hold") or (kind == "skip" and stage in STAGE):
+            notes.append(f"{kind}: {job_id if job_id != '-' else f'issue #{n}'}"
+                         + (f" ({stage})" if stage != "-" else "") + f": {note}")
+    orphaned = {job_id for kind, _, job_id, stage, _ in rows if kind == "skip" and stage in STAGE}
+    busy = []
+    for job in all_jobs():
+        if job["id"] in orphaned or (only is not None and job["issue"] != only):
+            continue
+        if job["stage"] not in STAGE:
+            if job["stage"] not in WAITING | TERMINAL:
+                notes.append(f"blocked: {job['id']} is in {job['stage']}, a stage config.json no longer has; "
+                             "put the stage back or reject the job")
+            continue
+        if job["handed"] == job["step"] and not resume:
+            busy.append(f"{job['id']} ({job['stage']})")
+            continue
+        job = sync(load(job["id"]))
+        try:
+            print(action(job, resume))
+        except Refused as e:
+            notes.append(f"blocked: {e}")
+            continue
+        job["handed"] = job["step"]
+        save(job)
+        busy.append(f"{job['id']} ({job['stage']})")
+    for note in notes:
+        print(note)
+    print(f"in progress: {', '.join(busy)}" if busy else "idle: no job is running")
+
+
+def cmd_done(arg):
+    job = resolve(arg, change=False)
+    stage, job_id = job["stage"], job["id"]
+    if stage not in STAGE:
+        die(f"{job_id} is in {stage}: no stage is running")
+    if is_script(stage):
+        die(f"{job_id} is in {stage}, a script stage: factory/bin/job run {job_id}")
+    # Route before taking the job's lock: factory/bin/route calls `job` itself.
+    if stage == ORDER[0] and ROUTED_STAGE and not job["agents"] and status_of(output_path(job, stage)) == "DONE":
+        res = subprocess.run([str(BIN / "route"), job_id], capture_output=True, text=True)
+        if res.returncode != 0:
+            die(res.stderr.strip().removeprefix("route: "))
+    job = sync(load(job_id))
+    if job["stage"] != stage:  # another `job done` got here first, while this one waited for the lock
+        print(f"{job_id}: already moved on to {job['stage']} (round {job['round']})")
+        return
+    reports, missing = {}, []
+    for key, file, _ in stage_agents(job, stage):
+        path = output_path(job, stage, key)
+        who = key or agent_name(file)
+        if not path.exists():
+            missing.append(who)
+            continue
+        require(status_of(path), f"{relative(path)} starts with {first_line(path)!r}, "
+                                 f"not STATUS: and one of {', '.join(STATUSES)}")
+        reports[who] = (status_of(path), path)
+    if missing and is_routed(stage):
+        save(job)
+        print(f"{job_id}: {stage} (round {job['round']}), waiting for: {', '.join(missing)}")
+        return
+    require(not missing, f"{relative(output_path(job, stage))} doesn't exist")
+    if is_routed(stage):
+        odd = [f"{who} reported {status} in {relative(path)}" for who, (status, path) in reports.items()
+               if status not in ("DONE", "REDO")]
+        asking = [who for who, (status, _) in reports.items() if status == "REDO"]
+        if odd:
+            job = needs_human(job, f"The {stage} stage can't continue: {'; '.join(odd)}.")
+        else:
+            job = apply(job, "REDO" if asking else "DONE", asking=asking)
+    else:
+        (who, (status, path)), = reports.items()
+        job = apply(job, status, source=path, who=who)
+    save(sync(job))
+    print(f"{job_id}: {stage} → {job['stage']} (round {job['round']})")
+
+
+def cmd_run(arg):
+    job = resolve(arg, change=False)
+    stage, job_id, step = job["stage"], job["id"], job["step"]
+    if stage not in STAGE or not is_script(stage):
+        die(f"{job_id} is in {stage}, not a script stage")
+    cmd = shlex.split(STAGE[stage]["script"].format(job=job_id))
+    # Without the job's lock: the script may be `job` itself, moving the job.
+    res = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
+    sys.stdout.write(res.stdout)
+    job = load(job_id)
+    if job["step"] != step:
+        return  # the script moved the job itself, as `job merge` does
+    owns_the_move = Path(cmd[0]).name == "job"
+    if owns_the_move or res.returncode not in (0, 1) or not output_path(job, stage).exists():
+        die(f"`{' '.join(cmd)}` exited {res.returncode} without a result: {(res.stderr or res.stdout).strip()}")
+    job = apply(sync(job), "DONE" if res.returncode == 0 else "REDO", source=output_path(job, stage))
+    save(sync(job))
+    print(f"{job_id}: {stage} → {job['stage']} (round {job['round']})")
+
+
+def cmd_fail(job, text):
+    if job["stage"] not in STAGE:
+        die(f"{job['id']} is in {job['stage']}: no stage is running")
+    if not text.strip():
+        die("no error on stdin")
+    stage = job["stage"]
+    save(sync(needs_human(sync(job), f"The factory couldn't finish the {stage} stage:\n\n{text.strip()}")))
+    print(f"{job['id']}: {stage} → needs-human")
 
 
 def cmd_merge(job):
     sync(job)
-    if job["stage"] == "approve":
-        save(advance(job, "merging"))
-    if job["stage"] != "merging":
-        die(f"{job['id']} is in {job['stage']}, not approve or merging")
+    if job["stage"] != MERGE_STAGE:
+        die(f"{job['id']} is in {job['stage']}, not {MERGE_STAGE}")
     if job["pr"] and pr_state(job) == "MERGED":
-        save(advance(sync(job), "merged"))
+        save(merged(job))
         print(f"{job['id']}: merged PR #{job['pr']}")
         return
 
     def fail(why):
-        escalate(job, why)
-        save(advance(sync(job), "needs-human"))
+        save(sync(needs_human(job, why)))
         print(f"{job['id']}: needs-human: {why.splitlines()[0]}")
 
     git(job, "fetch", "origin", BASE)
-    merged = git(job, "merge", "--no-edit", f"origin/{BASE}", check=False)
-    if merged.returncode != 0:
+    synced = git(job, "merge", "--no-edit", f"origin/{BASE}", check=False)
+    if synced.returncode != 0:
         git(job, "merge", "--abort", check=False)
-        return fail(f"The branch conflicts with {BASE}:\n\n```\n{merged.stdout.strip()}\n```")
+        return fail(f"The branch conflicts with {BASE}:\n\n```\n{synced.stdout.strip()}\n```")
     gate = subprocess.run([str(BIN / "gate"), job["id"], "--merge"], capture_output=True, text=True)
     if gate.returncode != 0:
         return fail(f"The gate failed after syncing with {BASE}. "
-                    f"See round-{job['round']}/merge-checks.md.\n\n{gate.stdout.strip()}")
+                    f"See {relative(output_path(job, MERGE_STAGE))}.\n\n{gate.stdout.strip()}")
     try:
         git(job, "push", "origin", job["branch"])
         if gh_json("pr", "view", str(job["pr"]), "--json", "isDraft")["isDraft"]:
@@ -665,7 +925,7 @@ def cmd_merge(job):
         return fail(f"The merge failed:\n\n```\n{e}\n```")
     # GitHub may already have deleted the branch on merge.
     run(["git", "push", "origin", "--delete", job["branch"]], check=False)
-    save(advance(sync(job), "merged"))
+    save(sync(merged(job)))
     print(f"{job['id']}: merged PR #{job['pr']}")
 
 
@@ -674,11 +934,20 @@ def cmd_feedback(job, text):
         die(f"{job['id']} is in {job['stage']}, not needs-human")
     if not text.strip():
         die("no feedback on stdin")
+    sync(job)
     d = job_dir(job["id"])
     k = len(list(d.glob("feedback-*.md"))) + 1
     (d / f"feedback-{k}.md").write_text(f"# Feedback {k}\n\nFrom @{operator()} after the job escalated.\n\n{text.strip()}\n")
-    save(advance(sync(job), "build"))
-    print(f"{job['id']}: feedback-{k}.md, round {job['round']}")
+    label("issue", job["issue"], remove=LABELS["needs_human"])
+    parked_at = job["waiting_from"]
+    if parked_at in STAGE and before_redo(parked_at):
+        reopen(job, parked_at)  # nothing was built yet: the stage that stopped tries again
+    else:
+        job["round_limit"] = job["round"] + CONFIG["max_rounds"]
+        next_round(job)
+        move(job, REDO_STAGE)
+    save(sync(job))
+    print(f"{job['id']}: feedback-{k}.md, {job['stage']}" + (f" round {job['round']}" if job["round"] else ""))
 
 
 def cmd_reject(job, text):
@@ -686,14 +955,16 @@ def cmd_reject(job, text):
         die(f"{job['id']} is already {job['stage']}")
     if not text.strip():
         die("no reason on stdin")
-    (job_dir(job["id"]) / "rejection.md").write_text(f"REJECTED\n\nBy @{operator()} while the job was {job['stage']}.\n\n{text.strip()}\n")
-    save(advance(sync(job), "rejected"))
+    reason = f"By @{operator()} while the job was {job['stage']}.\n\n{text.strip()}"
+    (job_dir(job["id"]) / "rejection.md").write_text(f"STATUS: REJECTED\n\n{reason}\n")
+    comment("issue", job["issue"], f"### Factory: rejected\n\n{reason}")
+    save(sync(rejected(sync(job))))
     print(f"{job['id']}: rejected")
 
 
 def cmd_agents(job, spec):
-    if job["stage"] != "intake" or (job["intake"] or {}).get("decision") != "ACCEPT":
-        die(f"{job['id']}: route only an intake job that intake ACCEPTed")
+    if job["stage"] != ORDER[0] or (job["intake"] or {}).get("status") != "DONE":
+        die(f"{job['id']}: route only a job whose {ORDER[0]} said STATUS: DONE")
     job["agents"] = json.loads(spec)
     save(job)
 
@@ -718,20 +989,60 @@ def cmd_summary(args):
     print(f"total ${sum(j['cost_usd'] for j in jobs):.2f} (API-equivalent, factory agents only)")
 
 
+def cmd_check():
+    """Everything config.json points at that could be missing or misspelled."""
+    problems = config_problems()
+    files = [(s["name"], s["agent"]["file"]) for s in STAGES if "agent" in s and s["agent"].get("file")]
+    routed = {key for table in list(CONFIG["routing"].values()) + list(CONFIG["surface_reviewers"].values()) for key in table}
+    files += [(s["name"], s["agents"]["routed"].format(agent=key))
+              for s in STAGES if "agents" in s and "routed" in s["agents"] for key in sorted(routed)]
+    for stage, file in files:
+        path = AGENTS_DIR / file
+        if not path.exists():
+            problems.append(f"stage {stage}: .claude/agents/{file} doesn't exist")
+        elif not re.search(r"^name:\s*\S+", path.read_text(), re.M):
+            problems.append(f"stage {stage}: .claude/agents/{file} has no `name:` in its frontmatter")
+    for spec in STAGES:
+        if "script" in spec and not (REPO / shlex.split(spec["script"])[0]).exists():
+            problems.append(f"stage {spec.get('name')}: {shlex.split(spec['script'])[0]} doesn't exist")
+    if ROUTED_STAGE is None and (CONFIG["routing"] or CONFIG["surface_reviewers"]):
+        problems.append("routing is set, but no stage runs routed agents")
+    if MERGE_STAGE is None:
+        print("note: no stage runs `factory/bin/job merge {job}`, so every job ends by waiting for you to merge its PR")
+    for key in ("queue", "needs_info", "needs_human"):
+        if key not in LABELS:
+            problems.append(f"labels.{key} is missing")
+    for problem in problems:
+        print(f"config.json: {problem}", file=sys.stderr)
+    if problems:
+        sys.exit(1)
+    print(f"config.json: ok, {len(STAGES)} stages: {' → '.join(ORDER)}")
+
+
 def main(argv):
     if not argv or argv[0] in {"-h", "--help"}:
         print(__doc__.strip())
         return
     cmd, args = argv[0], argv[1:]
+    if cmd == "check" and not args:
+        return cmd_check()
+    problems = config_problems()
+    if problems:
+        die("config.json: " + "; ".join(problems))
     try:
-        if cmd == "queue" and not args:
+        if cmd == "next" and len([a for a in args if a != "--resume"]) <= 1 and all(a.isdigit() or a == "--resume" for a in args):
+            only = next((int(a) for a in args if a.isdigit()), None)
+            cmd_next(only, "--resume" in args)
+        elif cmd == "done" and len(args) == 1:
+            cmd_done(args[0])
+        elif cmd == "run" and len(args) == 1:
+            cmd_run(args[0])
+        elif cmd == "fail" and len(args) == 1:
+            cmd_fail(resolve(args[0]), sys.stdin.read())
+        elif cmd == "queue" and not args:
             cmd_queue()
         elif cmd == "create" and len(args) == 1 and args[0].isdigit():
-            cmd_create(args[0])
-        elif cmd == "advance" and len(args) == 2:
-            job = advance(sync(resolve(args[0])), args[1])
-            save(sync(job))
-            print(f"{job['id']}: {job['stage']} (round {job['round']})")
+            print(create(args[0])["id"])
         elif cmd == "merge" and len(args) == 1:
             cmd_merge(resolve(args[0]))
         elif cmd == "feedback" and len(args) == 1:

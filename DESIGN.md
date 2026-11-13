@@ -19,30 +19,70 @@ skim a job on the dashboard and read the detail only where it matters.
 | Piece | File | Job |
 |---|---|---|
 | Queue | GitHub issues labeled `factory` | What to build. Anyone can file an issue; only people with triage or write access can label it. |
-| Orchestrator | `.claude/skills/factory/SKILL.md` | The session that runs `/factory`. Starts jobs, spawns agents, calls the scripts. Writes nothing itself. |
+| Pipeline | `stages` in `factory/config.json` | The stages in order: who runs each, what it reads, the file it writes. |
+| Orchestrator | `.claude/skills/factory/SKILL.md` | The session that runs `/factory`. A loop: ask `job next`, spawn or run what it prints, report with `job done`. Decides nothing. |
 | Agents | `.claude/agents/*.md` | One file per role. Each reads files, writes exactly one file, and replies with one line. |
 | State | `factory/jobs/<job-id>/` | `job.json` plus every agent's file. Gitignored, local to the machine running the factory. |
-| Spine | `factory/bin/job`, `gate`, `route` | Deterministic. `job` is the only writer of `job.json` and refuses illegal moves. |
+| Engine | `factory/bin/job`, `gate`, `route` | Deterministic. `job` reads the pipeline, moves each job by the status its stage reported, and is the only writer of `job.json`. |
 | Checks | `factory/checks.sh` | The repo's test, lint, typecheck and build commands. The only repo-specific script. |
 | Exit | the PR | Every job ends as a PR that closes its issue. Merging it is the approval. |
 
 ## Pipeline
 
 ```
-intake (fable)     → ACCEPT (scope possibly changed) | NEEDS-INFO | REJECT, posted as an issue comment
+intake             → DONE (scope possibly changed) | NEEDS-INFO | REJECTED, posted as an issue comment
 route (script)     → reviewers + models from risk/surfaces via config.json
 worktree           → factory/<job-id> from origin/main
-spec-writer (opus) → spec.md
+spec-writer        → spec.md
 builder            → commits; first round pushes + opens draft PR "Closes #<n>"
-gate (script)      → checks.sh; FAIL → builder gets the log, no reviewers spawned
-reviewers (routed) → parallel, WAIT FOR ALL; CHANGES → builder → gate → reviewers (max rounds)
-approver (opus)    → APPROVE: sync origin/main, gate, gh pr merge
-                     ESCALATE: PR ready, decision as PR comment, label factory:needs-human
+gate (script)      → checks.sh; REDO → builder gets the log, no reviewers spawned
+reviewers (routed) → parallel, wait for all; REDO → builder → gate → reviewers (max rounds)
+approver           → DONE: merging (sync origin/main, gate, gh pr merge)
+                     NEEDS-HUMAN: PR ready, decision as PR comment, label factory:needs-human
 ```
 
-`stage` in `job.json` is one of `intake`, `needs-info`, `spec`, `build`,
-`gate`, `review`, `approve`, `merging`, `needs-human`, `merged`, `rejected`.
-The legal moves are in `TRANSITIONS` at the top of `factory/bin/job`.
+`stage` in `job.json` is one of the stage names in `config.json`, or
+`needs-info`, `needs-human`, `merged`, `rejected`.
+
+## Stages and statuses
+
+A stage in `config.json` is four facts:
+
+```json
+{"name": "build", "agent": {"file": "builder.md"},
+ "input": ["spec.md", "issue.md", "intake.md", "round-{prev}/*", "feedback-*.md", "decision.md?"],
+ "output": "build.md"}
+```
+
+- **Who runs it**: `agent` (a file in `.claude/agents/`), `agents` (the routed
+  reviewers, one file each), or `script` (a command; `{job}` is the job id).
+- **`input`**: files in the job folder. A plain name must exist before the
+  stage starts. A pattern with `*`, or a name ending in `?`, lists what is
+  there. `{round}`, `{prev}` and `{agent}` are filled in.
+- **`output`**: the one file the stage writes.
+
+`job next` turns that into the agent's prompt: the job's header, then the files
+to read and the file to write. The agent files don't list files; they say how
+to do the work. So a file's name lives in one place.
+
+Every stage ends with a status on the first line of its output. A script stage
+reports by its exit code instead (0 is `DONE`, 1 is `REDO`).
+
+| Status | What `job` does |
+|---|---|
+| `DONE` | The next stage in the list. After the last one, the job waits for its PR to be merged. |
+| `REDO` | Back to `redo_stage` (the builder) with the round counter raised; `needs-human` on the last round. |
+| `NEEDS-INFO` | Posts the file on the issue, labels it, waits for the author. Their reply sends the job back to the stage that asked. |
+| `NEEDS-HUMAN` | PR ready, the reason as a PR comment, issue labeled. Your feedback starts another round. |
+| `REJECTED` | Says why on the issue, removes the label, closes the PR. |
+
+Several agents in one stage: `DONE` when all say `DONE`, `REDO` when any says
+`REDO`.
+
+Some behaviour belongs to a stage's place in the pipeline and stays in code:
+the first stage's acceptance is posted on the issue and routes the reviewers,
+leaving it creates the worktree, and the `redo_stage` is done only once its
+branch is pushed and has one open PR.
 
 ## Decisions
 
@@ -51,6 +91,14 @@ The legal moves are in `TRANSITIONS` at the top of `factory/bin/job`.
 runs on your machine, on your Claude plan, when you start it. An issue can't
 start a Claude Code session by itself, and keeping it local means your
 worktrees, dev servers and dashboard are right there.
+
+**The pipeline is data, and a script reads it.** The orchestrator used to carry
+the pipeline in its instructions and decide each next step. Now `job next`
+prints what to spawn or run, with the prompt written out, and `job done` reads
+the status and moves the job. Routing by a fixed set of statuses is a table
+lookup, so no model does it: nothing can skip a stage, misread a verdict or
+build a prompt slightly wrong. When a step fails twice, `job fail` hands the
+job to you with the error.
 
 **One orchestrator for every job.** The session running `/factory run` starts up
 to `concurrency` jobs and spawns every agent as a background subagent. There

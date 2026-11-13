@@ -203,7 +203,7 @@ class Gate(unittest.TestCase):
         self.assertEqual(res.stdout, "")
         self.assertTrue(res.stderr.startswith(
             "factory/checks.sh fails in your worktree (exit 4). The gate will reject this build. "
-            "Fix it, or write STATUS: BLOCKED in build.md if you can't.\n\nline 11\n"), res.stderr)
+            "Fix it, or write STATUS: NEEDS-HUMAN in build.md if you can't.\n\nline 11\n"), res.stderr)
         self.assertTrue(res.stderr.endswith("line 50\n"))
 
     def test_hook_reads_a_prompt_made_of_blocks(self):

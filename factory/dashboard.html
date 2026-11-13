@@ -352,17 +352,43 @@
 
 <script>
 const POLL_MS = 2000
-const COLUMNS = [
-  { label: 'Intake', who: 'intake · fable', stages: ['intake', 'needs-info'] },
-  { label: 'Spec', who: 'spec-writer · opus', stages: ['spec'] },
-  { label: 'Build', who: 'builder · gate', stages: ['build', 'gate'] },
-  { label: 'Review', who: 'routed reviewers', stages: ['review'] },
-  { label: 'Approve', who: 'approver · merge', stages: ['approve', 'merging'] },
+const WAITS = [
   { label: 'Needs human', who: 'you', stages: ['needs-human'], cls: 'human' },
   { label: 'Done', who: 'merged · rejected', stages: ['merged', 'rejected'], cls: 'merged-col' },
 ]
-const STAGES = new Set(COLUMNS.flatMap((c) => c.stages))
-const LIVE = new Set(['intake', 'spec', 'build', 'gate', 'review', 'approve', 'merging'])
+// The pipeline as config.json ships it, until the page has read the real one.
+let COLUMNS = [
+  { label: 'Intake', who: 'intake', stages: ['intake', 'needs-info'] },
+  { label: 'Spec', who: 'spec-writer', stages: ['spec'] },
+  { label: 'Build', who: 'builder · gate', stages: ['build', 'gate'] },
+  { label: 'Review', who: 'routed reviewers', stages: ['review'] },
+  { label: 'Approve', who: 'approver · merge', stages: ['approve', 'merging'] },
+  ...WAITS,
+]
+let LIVE = new Set(['intake', 'spec', 'build', 'gate', 'review', 'approve', 'merging'])
+let OUTPUTS = {} // stage -> the file it writes
+
+// One column per stage of config.json. A script stage (the gate, the merge)
+// shares the column of the stage before it, and the first column also holds
+// the jobs that wait for their author.
+function usePipeline(stages) {
+  const cols = []
+  for (const s of stages) {
+    const who = s.script ? (/\bjob merge\b/.test(s.script) ? 'merge' : s.script.split(' ')[0].split('/').pop())
+      : s.agent ? s.agent.file.replace(/\.md$/, '') : 'routed reviewers'
+    if (s.script && cols.length) {
+      cols[cols.length - 1].stages.push(s.name)
+      cols[cols.length - 1].who += ` · ${who}`
+    } else {
+      cols.push({ label: s.name[0].toUpperCase() + s.name.slice(1), who, stages: [s.name] })
+    }
+    OUTPUTS[s.name] = s.output
+  }
+  if (!cols.length) return
+  cols[0].stages.push('needs-info')
+  COLUMNS = [...cols, ...WAITS]
+  LIVE = new Set(stages.map((s) => s.name))
+}
 const SHORT = { code: 'code', ux: 'ux', ui: 'ui', security: 'sec' }
 const DOING = {
   intake: 'intake', spec: 'writing spec', build: 'building', gate: 'running checks',
@@ -400,8 +426,9 @@ async function fetchFirst(url) {
 
 function verdictOf(line) {
   if (line === null) return 'pending'
-  const m = line.match(/^(?:VERDICT|GATE):\s*(PASS|CHANGES|FAIL)$/)
-  return m ? m[1] : 'invalid'
+  // Every stage reports STATUS: DONE or REDO; the gate script says GATE: PASS or FAIL.
+  const m = line.match(/^(?:STATUS|GATE|VERDICT):\s*(DONE|REDO|PASS|CHANGES|FAIL)$/)
+  return m ? ({ DONE: 'PASS', REDO: 'CHANGES' }[m[1]] || m[1]) : 'invalid'
 }
 
 // A round's verdicts come from its files: the gate first, then each routed reviewer.
@@ -468,7 +495,8 @@ async function whyWaiting(job) {
   const key = `${job.id}/${job.stage}/${job.round}`
   if (whyCache.has(key)) return whyCache.get(key)
   let text
-  try { text = await fetchText(`jobs/${job.id}/${human ? 'decision.md' : 'intake.md'}`) } catch { return null }
+  const asked = OUTPUTS[job.waiting_from] || 'intake.md' // the stage that asked the author
+  try { text = await fetchText(`jobs/${job.id}/${human ? 'decision.md' : asked}`) } catch { return null }
   const body = human ? sectionOf(text, 'For the human') || sectionOf(text, 'Why') : sectionOf(text, 'Questions')
   let why = null
   if (body) {
@@ -492,7 +520,7 @@ function card(job, rounds, why) {
   const flag = human ? '<span class="flag">your call</span>'
     : job.stage === 'needs-info' ? '<span class="flag wait">asked author</span>'
     : job.stage === 'rejected' ? '<span class="flag wait">rejected</span>'
-    : live ? `<span class="flag live">${DOING[job.stage]}</span>` : ''
+    : live ? `<span class="flag live">${esc(DOING[job.stage] || job.stage)}</span>` : ''
   const risk = job.intake?.risk
   const meta = [
     risk ? `<span class="risk-${esc(risk)}">${esc(risk)}</span>` : '',
@@ -540,7 +568,7 @@ async function render() {
   const cards = new Map(COLUMNS.map((c) => [c, []]))
   const shown = jobs.filter(matches)
   for (const job of jobs) {
-    if (!STAGES.has(job.stage)) { problems.push(`Job ${job.id} has unknown stage "${job.stage}"`); continue }
+    if (!COLUMNS.some((c) => c.stages.includes(job.stage))) { problems.push(`Job ${job.id} has unknown stage "${job.stage}"`); continue }
     if (!shown.includes(job)) continue
     const rounds = []
     for (let n = 1; n <= job.round; n++) rounds.push(roundRow(job, n, await roundVerdicts(job, n)))
@@ -584,7 +612,11 @@ async function poll() {
   const status = $('status')
   try {
     if (concurrency === null) {
-      try { concurrency = JSON.parse(await fetchText('config.json')).concurrency } catch { concurrency = 0 }
+      try {
+        const config = JSON.parse(await fetchText('config.json'))
+        concurrency = config.concurrency
+        usePipeline(config.stages || [])
+      } catch { concurrency = 0 }
     }
     jobs = await loadJobs()
     await render()
@@ -642,9 +674,13 @@ function sortFiles(files) {
 }
 
 function tone(first) {
-  if (/^(VERDICT:\s*PASS|GATE:\s*PASS|APPROVE|STATUS:\s*READY|DECISION:\s*ACCEPT)$/.test(first)) return 'good'
+  if (/^(STATUS:\s*DONE|GATE:\s*PASS)$/.test(first)) return 'good'
+  if (/^STATUS:\s*(REDO|NEEDS-INFO)$/.test(first)) return 'warn'
+  if (/^(STATUS:\s*(NEEDS-HUMAN|REJECTED)|GATE:\s*FAIL)$/.test(first)) return 'stop'
+  // What the factory wrote before every stage shared one set of statuses.
+  if (/^(VERDICT:\s*PASS|APPROVE|STATUS:\s*READY|DECISION:\s*ACCEPT)$/.test(first)) return 'good'
   if (/^(VERDICT:\s*CHANGES|DECISION:\s*NEEDS-INFO)$/.test(first)) return 'warn'
-  if (/^(ESCALATE|REJECTED|STATUS:\s*BLOCKED|GATE:\s*FAIL|DECISION:\s*REJECT)$/.test(first)) return 'stop'
+  if (/^(ESCALATE|REJECTED|STATUS:\s*BLOCKED|DECISION:\s*REJECT)$/.test(first)) return 'stop'
   return null
 }
 

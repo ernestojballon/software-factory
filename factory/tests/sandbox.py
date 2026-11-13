@@ -27,6 +27,23 @@ CONFIG = {
     "checks_timeout_seconds": 60,
     "base_branch": "main",
     "merge_method": "merge",
+    "redo_stage": "build",
+    "stages": [
+        {"name": "intake", "agent": {"file": "intake.md"},
+         "input": ["issue.md", "intake-*.md", "feedback-*.md"], "output": "intake.md"},
+        {"name": "spec", "agent": {"file": "spec-writer.md"},
+         "input": ["issue.md", "intake.md", "feedback-*.md"], "output": "spec.md"},
+        {"name": "build", "agent": {"file": "builder.md"},
+         "input": ["spec.md", "issue.md", "intake.md", "round-{prev}/*", "feedback-*.md", "decision.md?"], "output": "build.md"},
+        {"name": "gate", "script": "factory/bin/gate {job}", "output": "round-{round}/checks.md"},
+        {"name": "review", "agents": {"routed": "reviewer-{agent}.md"},
+         "input": ["spec.md", "build.md", "round-{round}/checks.md", "round-*/review-{agent}.md"],
+         "output": "round-{round}/review-{agent}.md"},
+        {"name": "approve", "agent": {"file": "approver.md"},
+         "input": ["issue.md", "intake.md", "spec.md", "build.md", "feedback-*.md", "round-*/*.md"],
+         "output": "decision.md"},
+        {"name": "merging", "script": "factory/bin/job merge {job}", "output": "round-{round}/merge-checks.md"},
+    ],
     "labels": {"queue": "factory", "needs_info": "factory:needs-info", "needs_human": "factory:needs-human"},
     "routing": {"low": {"code": "haiku"}, "medium": {"code": "sonnet"}, "high": {"code": "sonnet"}},
     "surface_reviewers": {"ui": {"ux": "sonnet", "ui": "haiku"}, "security": {"security": "opus"}},
@@ -181,6 +198,10 @@ class Sandbox:
 
     def set_checks(self, body):
         self.write("factory/checks.sh", f"set -euo pipefail\n{body}\n")
+
+    def write_agent(self, file, name=None):
+        """An agent definition, as Claude Code reads it from .claude/agents/."""
+        self.write(f".claude/agents/{file}", f"---\nname: {name or file.removesuffix('.md')}\nmodel: opus\n---\n\nWork.\n")
 
     def job(self, job_id):
         return json.loads((self.jobs / job_id / "job.json").read_text())
