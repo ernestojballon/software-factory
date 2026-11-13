@@ -139,6 +139,3 @@ They come from a test run on a small private calculator repo, with
 
 [GPLv3](LICENSE). You can use, modify and share this code, and any version you
 distribute must also be released under GPLv3.
-
-Based on the Software Factory for Claude Code (v2) by ZazenCodes, published
-under GPLv3. Copied in November 2026 with the promotional material removed.
