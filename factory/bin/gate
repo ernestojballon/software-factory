@@ -10,112 +10,266 @@ The gate runs the main checkout's factory/checks.sh inside the job's worktree,
 so a branch can't change the checks it is judged by. It also fails when the
 branch modifies or deletes a file matching config.json `protected_paths`
 (fnmatch patterns, where `*` also matches `/`). Adding new files is fine.
+checks.sh is killed, and the gate fails, after config.json
+`checks_timeout_seconds`.
 """
 
 import fnmatch
 import json
+import os
+import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 FACTORY = REPO / "factory"
-CONFIG = json.loads((FACTORY / "config.json").read_text())
 CHECKS = FACTORY / "checks.sh"
-TAIL = 80
+
+EXIT_PASS = 0
+EXIT_FAIL = 1
+EXIT_ERROR = 2  # the gate couldn't run
+HOOK_BLOCK = 2  # tells Claude Code to keep the builder going, with stderr as the reason
+TIMED_OUT = 124  # recorded as checks.sh's exit code when it is killed
+REPORT_TAIL = 80
+HOOK_TAIL = 40
 
 
-def die(msg):
-    print(f"gate: {msg}", file=sys.stderr)
-    sys.exit(2)
+class GateError(Exception):
+    """The gate couldn't run. main reports it and exits EXIT_ERROR."""
+
+
+# ---- Inputs ----------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Config:
+    base_branch: str
+    protected_paths: list
+    timeout: int
+
+
+@dataclass(frozen=True)
+class Job:
+    id: str
+    worktree: str
+    round: int
+
+    @property
+    def round_dir(self):
+        return FACTORY / "jobs" / self.id / f"round-{self.round}"
+
+
+def load_config():
+    raw = json.loads((FACTORY / "config.json").read_text())
+    return Config(raw["base_branch"], raw["protected_paths"], raw["checks_timeout_seconds"])
+
+
+def load_job(job_id):
+    raw = json.loads((FACTORY / "jobs" / job_id / "job.json").read_text())
+    return Job(job_id, raw["worktree"], raw["round"])
+
+
+# ---- Git -------------------------------------------------------------------
 
 
 def git(worktree, *args):
     res = subprocess.run(["git", *args], cwd=worktree, capture_output=True, text=True)
     if res.returncode != 0:
-        die(f"`git {' '.join(args)}` failed: {res.stderr.strip()}")
+        raise GateError(f"`git {' '.join(args)}` failed: {res.stderr.strip()}")
     return res.stdout
 
 
-def protected_changes(worktree):
-    """Existing files under protected_paths that the branch modified or deleted."""
-    diff = git(worktree, "diff", "--name-status", f"origin/{CONFIG['base_branch']}...HEAD")
+def head_commit(worktree):
+    return git(worktree, "rev-parse", "HEAD").strip()
+
+
+def branch_diff(worktree, base_branch):
+    """What the branch changed since it left the base, as `git diff --name-status` lines."""
+    return git(worktree, "diff", "--name-status", f"origin/{base_branch}...HEAD")
+
+
+# ---- The two rules ---------------------------------------------------------
+
+
+def protected_changes(diff, patterns):
+    """Existing files matching patterns that the diff modifies or deletes."""
     hits = []
     for line in diff.splitlines():
         status, *paths = line.split("\t")
         if status.startswith("A"):
             continue
         old = paths[0]  # for renames and copies, the original path
-        if any(fnmatch.fnmatch(old, pattern) for pattern in CONFIG["protected_paths"]):
+        if any(fnmatch.fnmatch(old, pattern) for pattern in patterns):
             hits.append(f"{status[0]} {old}")
     return hits
 
 
-def run_checks(worktree):
+@dataclass(frozen=True)
+class CheckRun:
+    code: int
+    log: str
+    seconds: int
+
+    @property
+    def passed(self):
+        return self.code == 0
+
+
+def run_checks(worktree, timeout):
     start = time.monotonic()
-    res = subprocess.run(["bash", str(CHECKS)], cwd=worktree, capture_output=True, text=True)
-    return res.returncode, res.stdout + res.stderr, int(time.monotonic() - start)
+    # Its own process group, so a timeout also kills whatever checks.sh started.
+    proc = subprocess.Popen(["bash", str(CHECKS)], cwd=worktree, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        code = proc.returncode
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        out, err = proc.communicate()
+        err += f"\nchecks.sh timed out after {timeout}s (config.json checks_timeout_seconds)\n"
+        code = TIMED_OUT
+    return CheckRun(code, out + err, int(time.monotonic() - start))
 
 
-def gate(job_id, merge):
-    job = json.loads((FACTORY / "jobs" / job_id / "job.json").read_text())
-    worktree = job["worktree"]
-    if job["round"] < 1:
-        die(f"{job_id} hasn't started a build round")
-    round_dir = FACTORY / "jobs" / job_id / f"round-{job['round']}"
-    commit = git(worktree, "rev-parse", "HEAD").strip()
-    protected = protected_changes(worktree)
-    code, log, seconds = run_checks(worktree)
-    verdict = "PASS" if code == 0 and not protected else "FAIL"
-    name = "merge-checks" if merge else "checks"
-    (round_dir / f"{name}.log").write_text(log)
-    tail = "\n".join(log.rstrip().splitlines()[-TAIL:])
-    summary = [
-        f"checks.sh {'passed' if code == 0 else f'failed with exit {code}'} in {seconds}s",
-        f"Protected paths: {'changed: ' + ', '.join(protected) if protected else 'none changed'}",
-        f"Commit {commit[:7]}" + (", synced with the latest main before merging" if merge else ""),
+# ---- The verdict and its report --------------------------------------------
+
+
+@dataclass(frozen=True)
+class GateResult:
+    job: Job
+    commit: str
+    protected: list
+    checks: CheckRun
+    merge: bool
+
+    @property
+    def verdict(self):
+        rules = (self.checks.passed, not self.protected)
+        return "PASS" if all(rules) else "FAIL"
+
+    @property
+    def name(self):
+        """The stem of the report and log files."""
+        return "merge-checks" if self.merge else "checks"
+
+
+def evaluate(job, config, merge):
+    if job.round < 1:
+        raise GateError(f"{job.id} hasn't started a build round")
+    commit = head_commit(job.worktree)
+    protected = protected_changes(branch_diff(job.worktree, config.base_branch), config.protected_paths)
+    return GateResult(job, commit, protected, run_checks(job.worktree, config.timeout), merge)
+
+
+def tail(log, lines):
+    return "\n".join(log.rstrip().splitlines()[-lines:])
+
+
+def summary_bullets(result):
+    checks = result.checks
+    outcome = "passed" if checks.passed else f"failed with exit {checks.code}"
+    protected = "changed: " + ", ".join(result.protected) if result.protected else "none changed"
+    synced = ", synced with the latest main before merging" if result.merge else ""
+    return [
+        f"checks.sh {outcome} in {checks.seconds}s",
+        f"Protected paths: {protected}",
+        f"Commit {result.commit[:7]}{synced}",
     ]
-    (round_dir / f"{name}.md").write_text(
-        f"GATE: {verdict}\nCOMMIT: {commit}\n\n"
-        "## Summary\n" + "\n".join(f"- {s}" for s in summary) + "\n\n"
+
+
+def render_report(result):
+    checks = result.checks
+    summary = "\n".join(f"- {bullet}" for bullet in summary_bullets(result))
+    protected = "\n".join(f"- {path}" for path in result.protected) if result.protected else "None changed."
+    return (
+        f"GATE: {result.verdict}\n"
+        f"COMMIT: {result.commit}\n"
+        "\n"
+        "## Summary\n"
+        f"{summary}\n"
+        "\n"
         "## Protected paths\n"
-        + ("\n".join(f"- {p}" for p in protected) if protected else "None changed.")
-        + f"\n\n## checks.sh\nExit {code} in {seconds}s. Last {TAIL} lines of {name}.log:\n\n```\n{tail}\n```\n"
+        f"{protected}\n"
+        "\n"
+        "## checks.sh\n"
+        f"Exit {checks.code} in {checks.seconds}s. Last {REPORT_TAIL} lines of {result.name}.log:\n"
+        "\n"
+        "```\n"
+        f"{tail(checks.log, REPORT_TAIL)}\n"
+        "```\n"
     )
-    print(f"GATE: {verdict} ({job_id} round {job['round']}, checks.sh exit {code} in {seconds}s"
-          + (f", protected paths changed: {', '.join(protected)}" if protected else "") + ")")
-    sys.exit(0 if verdict == "PASS" else 1)
 
 
-def hook():
-    event = json.load(sys.stdin)
-    if event.get("stop_hook_active"):
-        sys.exit(0)  # one nudge per stop; the gate decides
-    with open(Path(event["agent_transcript_path"]).expanduser()) as f:
+def status_line(result):
+    protected = f", protected paths changed: {', '.join(result.protected)}" if result.protected else ""
+    return (f"GATE: {result.verdict} ({result.job.id} round {result.job.round}, "
+            f"checks.sh exit {result.checks.code} in {result.checks.seconds}s{protected})")
+
+
+def write_report(result):
+    round_dir = result.job.round_dir
+    (round_dir / f"{result.name}.log").write_text(result.checks.log)
+    (round_dir / f"{result.name}.md").write_text(render_report(result))
+
+
+# ---- The builder's hook ----------------------------------------------------
+
+
+def first_prompt(transcript_path):
+    """The text of the prompt an agent was started with."""
+    with open(Path(transcript_path).expanduser()) as f:
         content = json.loads(f.readline())["message"]["content"]
-    prompt = content if isinstance(content, str) else " ".join(b.get("text", "") for b in content)
-    job_id = prompt.split("Job: ", 1)[1].split(".", 1)[0]
-    job = json.loads((FACTORY / "jobs" / job_id / "job.json").read_text())
-    code, log, _ = run_checks(job["worktree"])
-    if code != 0:
-        tail = "\n".join(log.rstrip().splitlines()[-40:])
-        print(f"factory/checks.sh fails in your worktree (exit {code}). The gate will reject this "
-              f"build. Fix it, or write STATUS: BLOCKED in build.md if you can't.\n\n{tail}",
-              file=sys.stderr)
-        sys.exit(2)
+    return content if isinstance(content, str) else " ".join(block.get("text", "") for block in content)
+
+
+def job_id_from_prompt(prompt):
+    """Every factory prompt starts `Job: <id>. Job folder: ...`."""
+    return prompt.split("Job: ", 1)[1].split(".", 1)[0]
+
+
+def hook_nudge(checks):
+    return (f"factory/checks.sh fails in your worktree (exit {checks.code}). The gate will reject this "
+            f"build. Fix it, or write STATUS: BLOCKED in build.md if you can't.\n\n{tail(checks.log, HOOK_TAIL)}")
+
+
+# ---- Commands --------------------------------------------------------------
+
+
+def run_gate(job_id, config, merge):
+    result = evaluate(load_job(job_id), config, merge)
+    write_report(result)
+    print(status_line(result))
+    return EXIT_PASS if result.verdict == "PASS" else EXIT_FAIL
+
+
+def run_hook(event, config):
+    if event.get("stop_hook_active"):
+        return EXIT_PASS  # one nudge per stop; the gate decides
+    job = load_job(job_id_from_prompt(first_prompt(event["agent_transcript_path"])))
+    checks = run_checks(job.worktree, config.timeout)
+    if checks.passed:
+        return EXIT_PASS
+    print(hook_nudge(checks), file=sys.stderr)
+    return HOOK_BLOCK
 
 
 def main(argv):
+    config = load_config()
     if argv == ["--hook"]:
-        hook()
-    elif len(argv) == 1 and not argv[0].startswith("-"):
-        gate(argv[0], merge=False)
-    elif len(argv) == 2 and argv[1] == "--merge":
-        gate(argv[0], merge=True)
-    else:
-        die(__doc__.strip())
+        return run_hook(json.load(sys.stdin), config)
+    if len(argv) == 1 and not argv[0].startswith("-"):
+        return run_gate(argv[0], config, merge=False)
+    if len(argv) == 2 and argv[1] == "--merge":
+        return run_gate(argv[0], config, merge=True)
+    raise GateError(__doc__.strip())
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except GateError as e:
+        print(f"gate: {e}", file=sys.stderr)
+        sys.exit(EXIT_ERROR)

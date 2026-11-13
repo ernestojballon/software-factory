@@ -95,7 +95,7 @@ v1.
 ## Dashboard
 
 ```bash
-cd factory && python3 -m http.server
+cd factory && python3 -m http.server --bind 127.0.0.1
 ```
 
 Open <http://localhost:8000/dashboard.html>. Each job is a card with its issue

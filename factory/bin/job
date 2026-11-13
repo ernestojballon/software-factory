@@ -12,7 +12,7 @@ Usage:
   job advance <job> <stage>      move a job to <stage>, or refuse
   job merge <job>                APPROVE → sync with the base branch, gate, merge the PR
   job feedback <job>             needs-human → build, with your feedback (stdin) as feedback-<k>.md
-  job reject <job>               needs-info or needs-human → rejected, with your reason (stdin) as rejection.md
+  job reject <job>               any unfinished job → rejected, with your reason (stdin) as rejection.md
   job agents <job> <json>        record the routed agent set (called by factory/bin/route)
   job sync <job>                 refresh reviews, gate and cost from the job's files
   job summary [<job>...]         table of jobs: issue, stage, PR, cost, time
@@ -105,15 +105,26 @@ def job_dir(job_id):
 _locks = {}
 
 
-def load(job_id):
-    """Read a job, holding its lock until this process exits."""
+def lock(path):
+    """Hold an exclusive lock on path until this process exits."""
+    if path not in _locks:
+        _locks[path] = open(path, "w")
+        fcntl.flock(_locks[path], fcntl.LOCK_EX)
+
+
+def read(job_id):
     path = job_dir(job_id) / "job.json"
     if not path.exists():
         die(f"no job {job_id}")
-    if job_id not in _locks:
-        _locks[job_id] = open(job_dir(job_id) / ".lock", "w")
-        fcntl.flock(_locks[job_id], fcntl.LOCK_EX)
     return json.loads(path.read_text())
+
+
+def load(job_id):
+    """Read a job to change it, holding its lock until this process exits."""
+    if not (job_dir(job_id) / "job.json").exists():
+        die(f"no job {job_id}")
+    lock(job_dir(job_id) / ".lock")
+    return read(job_id)
 
 
 def save(job):
@@ -124,9 +135,12 @@ def save(job):
 
 
 def all_jobs():
+    """A snapshot of every job, read without locks: `save` replaces job.json
+    atomically. A command locks only the jobs it changes, so two commands
+    can't deadlock on each other's jobs."""
     if not JOBS.exists():
         return []
-    return [load(p.name) for p in sorted(JOBS.iterdir()) if (p / "job.json").exists()]
+    return [read(p.name) for p in sorted(JOBS.iterdir()) if (p / "job.json").exists()]
 
 
 def running(jobs):
@@ -135,18 +149,20 @@ def running(jobs):
 
 
 def require_slot(job_id):
+    JOBS.mkdir(parents=True, exist_ok=True)
+    lock(JOBS / ".slots.lock")  # one slot-taking command at a time
     busy = [j["id"] for j in running(all_jobs()) if j["id"] != job_id]
     require(len(busy) < CONCURRENCY,
             f"concurrency {CONCURRENCY} reached; running: {', '.join(busy)}")
 
 
-def resolve(arg):
+def resolve(arg, change=True):
     if arg.isdigit():
         matches = [j for j in all_jobs() if j["issue"] == int(arg)]
         if not matches:
             die(f"no job for issue #{arg}")
-        return matches[0]
-    return load(arg)
+        arg = matches[0]["id"]
+    return load(arg) if change else read(arg)
 
 
 def first_line(path):
@@ -231,7 +247,12 @@ def replied_since_question(issue):
 
 
 def comment(kind, number, body):
-    gh(kind, "comment", str(number), "--body", f"{MARKER}\n{body}")
+    """Post a factory comment, unless it is already the last one (a retried transition)."""
+    text = f"{MARKER}\n{body}"
+    posted = gh_json(kind, "view", str(number), "--json", "comments")["comments"]
+    if posted and posted[-1]["body"].replace("\r\n", "\n").strip() == text.strip():
+        return
+    gh(kind, "comment", str(number), "--body", text)
 
 
 def label(kind, number, add=None, remove=None):
@@ -256,6 +277,17 @@ def prompt_text(line):
     if isinstance(content, str):
         return content
     return " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+
+
+_unpriced = set()
+
+
+def unpriced(model):
+    """Warn once per run: a model missing from the price table mustn't stop a job."""
+    if model not in _unpriced:
+        _unpriced.add(model)
+        print(f"job: warning: no price for model {model} in factory/config.json "
+              "prices_usd_per_mtok; its tokens aren't counted in the cost", file=sys.stderr)
 
 
 def cost_usd(job):
@@ -286,7 +318,8 @@ def cost_usd(job):
             if tokens == 0:
                 continue
             if model not in prices:
-                die(f"no price for model {model} in factory/config.json prices_usd_per_mtok")
+                unpriced(model)
+                continue
             p = prices[model]
             split = u.get("cache_creation") or {}
             write_1h = split.get("ephemeral_1h_input_tokens", 0)
@@ -366,9 +399,11 @@ def next_round(job):
 
 def advance(job, stage):
     old = job["stage"]
-    require(stage in TRANSITIONS.get(old, set()) or (stage == "merged" and old not in TERMINAL),
-            f"{job['id']}: {old} → {stage} is not a legal transition")
     d = job_dir(job["id"])
+    # `job reject` writes rejection.md; with it, any unfinished job can be rejected.
+    rejecting = stage == "rejected" and (d / "rejection.md").exists()
+    require(stage in TRANSITIONS.get(old, set()) or (old not in TERMINAL and (stage == "merged" or rejecting)),
+            f"{job['id']}: {old} → {stage} is not a legal transition")
     decision = header(d / "intake.md").get("DECISION") if (d / "intake.md").exists() else None
     intake_body = lambda: "\n".join((d / "intake.md").read_text().split("\n\n", 1)[1:]).strip()
 
@@ -377,12 +412,12 @@ def advance(job, stage):
         if old == "needs-human":
             label("issue", job["issue"], remove=LABELS["needs_human"])
 
-    elif stage == "rejected" and old in WAITING:
-        require((d / "rejection.md").exists(), "use `job reject` to reject a waiting job")
+    elif stage == "rejected" and (rejecting or old in WAITING):
+        require(rejecting, "use `job reject` to reject a waiting job")
         reason = (d / "rejection.md").read_text().split("\n", 1)[1].strip()
         comment("issue", job["issue"], f"### Factory: rejected\n\n{reason}")
-        waiting = LABELS["needs_info"] if old == "needs-info" else LABELS["needs_human"]
-        label("issue", job["issue"], remove=f"{LABELS['queue']},{waiting}")
+        waiting = {"needs-info": LABELS["needs_info"], "needs-human": LABELS["needs_human"]}.get(old)
+        label("issue", job["issue"], remove=",".join(filter(None, [LABELS["queue"], waiting])))
         if job["pr"]:
             gh("pr", "close", str(job["pr"]))
             run(["git", "push", "origin", "--delete", job["branch"]], check=False)
@@ -395,23 +430,24 @@ def advance(job, stage):
             require(job["agents"], "route the job first: factory/bin/route " + job["id"])
             i = job["intake"]
             title += f" (risk {i['risk']}, surfaces: {', '.join(i['surfaces']) or 'none'})"
+        if stage == "spec" and not Path(job["worktree"]).exists():
+            # Before the comment, so a failure here leaves nothing to repeat on a retry.
+            run(["git", "fetch", "origin", BASE])
+            Path(job["worktree"]).parent.mkdir(parents=True, exist_ok=True)
+            run(["git", "worktree", "add", "-b", job["branch"], job["worktree"], f"origin/{BASE}"])
         comment("issue", job["issue"], f"{title}\n\n{intake_body()}")
         if stage == "needs-info":
             label("issue", job["issue"], add=LABELS["needs_info"])
         elif stage == "rejected":
             label("issue", job["issue"], remove=LABELS["queue"])
-        else:
-            run(["git", "fetch", "origin", BASE])
-            Path(job["worktree"]).parent.mkdir(parents=True, exist_ok=True)
-            run(["git", "worktree", "add", "-b", job["branch"], job["worktree"], f"origin/{BASE}"])
 
     elif old == "needs-info":
         require_slot(job["id"])
+        write_issue_md(job)
+        label("issue", job["issue"], remove=LABELS["needs_info"])
         k = len(list(d.glob("intake-*.md"))) + 1
         (d / "intake.md").rename(d / f"intake-{k}.md")
         job["intake"] = None
-        write_issue_md(job)
-        label("issue", job["issue"], remove=LABELS["needs_info"])
 
     elif old == "spec":
         require((d / "spec.md").exists(), "spec.md doesn't exist")
@@ -550,9 +586,12 @@ def cmd_queue():
     concurrency slots; the rest show as `hold` until a running job finishes."""
     jobs = {j["issue"]: j for j in all_jobs()}
     # A job is done once its PR is merged on GitHub, which also closes the issue.
-    for j in jobs.values():
+    for n, j in sorted(jobs.items(), key=lambda item: item[1]["id"]):
         if j["stage"] not in TERMINAL and j["pr"] and pr_state(j) == "MERGED":
-            save(advance(sync(j), "merged"))
+            j = load(j["id"])
+            if j["stage"] not in TERMINAL:
+                save(advance(sync(j), "merged"))
+            jobs[n] = j
     issues = gh_json("issue", "list", "--label", LABELS["queue"], "--state", "open",
                      "--limit", "200", "--json", "number,title")
     open_numbers = {i["number"] for i in issues}
@@ -578,7 +617,7 @@ def cmd_queue():
             running_rows.append(("resume", n, j["id"], j["stage"], f"round {j['round']}"))
     for n, j in sorted(jobs.items()):
         if n not in open_numbers and j["stage"] not in TERMINAL | WAITING:
-            other_rows.append(("skip", n, j["id"], j["stage"], f"issue is closed or no longer labeled {LABELS['queue']}"))
+            other_rows.append(("skip", n, j["id"], j["stage"], f"issue is closed or no longer labeled {LABELS['queue']}; holds a slot until the job is rejected"))
     # Jobs already in a running stage hold a slot whether or not an agent is on them.
     slots = CONCURRENCY - len(running(jobs.values()))
     rows = list(running_rows)
@@ -643,8 +682,8 @@ def cmd_feedback(job, text):
 
 
 def cmd_reject(job, text):
-    if job["stage"] not in WAITING:
-        die(f"{job['id']} is in {job['stage']}, not needs-info or needs-human")
+    if job["stage"] in TERMINAL:
+        die(f"{job['id']} is already {job['stage']}")
     if not text.strip():
         die("no reason on stdin")
     (job_dir(job["id"]) / "rejection.md").write_text(f"REJECTED\n\nBy @{operator()} while the job was {job['stage']}.\n\n{text.strip()}\n")
@@ -667,7 +706,7 @@ def elapsed(job):
 
 
 def cmd_summary(args):
-    jobs = [resolve(a) for a in args] if args else all_jobs()
+    jobs = [resolve(a, change=False) for a in args] if args else all_jobs()
     rows = [("job", "issue", "stage", "round", "pr", "cost", "time")]
     for j in jobs:
         sync(j)  # for display only; the orchestrator owns the saved state

@@ -70,12 +70,14 @@ It must be non-interactive, must not rewrite files (no `--fix`, no
 - `base_branch`: the default branch.
 - `merge_method`: `merge`, `squash` or `rebase`, one the repo allows
   (`gh api repos/{owner}/{repo} --jq '{allow_merge_commit, allow_squash_merge, allow_rebase_merge}'`).
-- `protected_paths`: keep the two factory entries and don't add the project's
+- `protected_paths`: keep the factory's own entries and don't add the project's
   tests. Features legitimately change existing tests (a new required field
   changes every fixture), and a protected test blocks the job with no way
   through. The code reviewer catches weakened or special-cased tests instead.
   Add a path only when no job should ever change it. They are fnmatch
   patterns, so `*` also matches `/`.
+- `checks_timeout_seconds`: raise it if the project's checks take longer than
+  30 minutes.
 - `ports`: move `base` if the project already uses ports 5100–5199.
 - Leave `concurrency`, `max_rounds`, `routing`, `surface_reviewers` and
   `prices_usd_per_mtok` as they are unless the user asks.
@@ -108,7 +110,7 @@ Then add a short section:
 `/factory run` builds every open GitHub issue labeled `factory` through
 intake → spec → build → gate → review → approve, one PR per issue. State is in
 `factory/jobs/` (gitignored); `factory/bin/job` is its only writer. Checks:
-`factory/checks.sh`. Dashboard: `cd factory && python3 -m http.server`, then
+`factory/checks.sh`. Dashboard: `cd factory && python3 -m http.server --bind 127.0.0.1`, then
 open http://localhost:8000/dashboard.html.
 
 Each job works in its own git worktree, a full checkout of the repo at

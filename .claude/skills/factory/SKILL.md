@@ -117,7 +117,10 @@ gate's `round-<N-1>/checks.md`, the reviews in `round-<N-1>/`, or
   once with the refusal. If it refuses again, stop this job and tell the user.
 - `STATUS: BLOCKED`: `factory/bin/job advance <id> needs-human`.
 
-**gate.** Run `factory/bin/gate <id>`. It prints `GATE: PASS` or `GATE: FAIL`.
+**gate.** Run `factory/bin/gate <id>` in the background (`run_in_background`):
+the checks may take longer than a foreground command is allowed, up to
+`checks_timeout_seconds` in `config.json`. When it exits, it has printed
+`GATE: PASS` or `GATE: FAIL`.
 
 - PASS: `factory/bin/job advance <id> review` and go to **review**.
 - FAIL: `factory/bin/job advance <id> build`. If it refuses because this was the
@@ -141,8 +144,9 @@ finished:
 
 **approve.** When the approver returns, read `decision.md`'s first line:
 
-- `APPROVE`: `factory/bin/job merge <id>`. It syncs the branch with the base,
-  runs the gate again, pushes, and merges the PR, ending in `merged`. If any
+- `APPROVE`: `factory/bin/job merge <id>`, in the background like the gate. It
+  syncs the branch with the base, runs the gate again, pushes, and merges the
+  PR, ending in `merged`. If any
   of that fails it moves the job to `needs-human` and says why.
 - `ESCALATE`: `factory/bin/job advance <id> needs-human`. It marks the PR ready,
   posts the decision on it and labels the issue `factory:needs-human`.
@@ -161,7 +165,9 @@ then moves the job to `merged`; stop any agents still running for it.
    `concurrency`: every job in a running stage holds a slot, and only as many
    `new` and replied `needs-info` lines as there are free slots come out as
    `new` or `resume`; the rest are `hold`. `job create` and the
-   `needs-info → intake` move refuse when no slot is free.
+   `needs-info → intake` move refuse when no slot is free. A `skip` line for a
+   job still in a running stage (its issue was closed or lost the label) keeps
+   its slot: tell the user, and reject the job if they agree.
 2. Start every `resume` and `new` line, nothing else. Don't judge issues
    yourself: every new issue goes to intake, which decides whether it gets
    built. For a new issue, `factory/bin/job create <n>` prints the job id;
@@ -213,8 +219,8 @@ new feature, ask.
   budget. Go to **build** with
   `The user gave feedback: read feedback-<k>.md and address it, push, and update build.md for round <N>.`
   and continue like any job.
-- **Rejecting or benching a `needs-info` or `needs-human` job**: pass their
-  reason verbatim on stdin:
+- **Rejecting or benching a job** (any job not yet merged or rejected; stop
+  its running agents first): pass their reason verbatim on stdin:
 
   ```bash
   factory/bin/job reject <n> <<'EOF'

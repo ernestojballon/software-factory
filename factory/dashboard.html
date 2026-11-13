@@ -21,6 +21,23 @@
     --merged: #bd93f9;
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f4f5f8;
+      --panel: #ffffff;
+      --card: #ffffff;
+      --card-hover: #eef0f5;
+      --line: #dcdfe8;
+      --text: #1b1d26;
+      --muted: #5c6278;
+      --faint: #9197ab;
+      --active: #0a7ea4;
+      --pass: #15803d;
+      --changes: #b45309;
+      --human: #d1242f;
+      --merged: #7c3aed;
+    }
+  }
   * { box-sizing: border-box; }
   html, body { margin: 0; }
   body {
@@ -49,9 +66,36 @@
     border-radius: 8px; color: var(--human); font-family: var(--mono); font-size: 12px;
   }
 
+  /* Stats */
+  .stats { display: flex; flex-wrap: wrap; align-items: stretch; gap: 10px; padding: 12px 32px 0; }
+  .tiles { display: contents; }
+  .stat {
+    min-width: 108px; padding: 8px 14px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 10px;
+  }
+  .stat b { display: block; font: 600 18px/1.35 var(--mono); }
+  .stat b small { font-size: 12px; font-weight: 400; color: var(--muted); }
+  .stat span { font-size: 11px; color: var(--muted); }
+  .stat.live.on b { color: var(--active); }
+  .stat.human.on { border-color: var(--human); }
+  .stat.human.on b { color: var(--human); }
+  .stat.info.on b { color: var(--changes); }
+  .search {
+    margin-left: auto; align-self: center; width: 220px; padding: 7px 12px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    color: var(--text); font: 12px var(--mono);
+  }
+  .search::placeholder { color: var(--faint); }
+  .search:focus-visible { outline: 2px solid var(--active); outline-offset: 1px; }
+  .blank {
+    margin: 16px 32px 0; padding: 14px 18px; border: 1px dashed var(--line);
+    border-radius: 10px; color: var(--muted); font-size: 13px;
+  }
+  .blank code, .why code { font-family: var(--mono); font-size: .92em; }
+
   /* Board */
   .board {
-    display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 12px;
+    display: grid; grid-template-columns: var(--cols, repeat(7, minmax(0, 1fr))); gap: 12px;
     padding: 20px 32px 40px; align-items: start;
   }
   .col { min-width: 0; }
@@ -90,6 +134,7 @@
   .card.done { opacity: .72; }
   .card.rejected .feature { text-decoration: line-through; text-decoration-color: var(--faint); }
   .flag.wait { color: var(--changes); }
+  .flag.live { color: var(--active); }
   .card-top { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
   .num { font-family: var(--mono); font-size: 12px; color: var(--muted); }
   .card-top .num { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -136,6 +181,19 @@
     overflow-wrap: anywhere;
   }
 
+  .why {
+    margin: 8px 0 0; padding: 6px 9px; border-left: 2px solid var(--human); border-radius: 0 6px 6px 0;
+    background: color-mix(in srgb, var(--human) 9%, transparent); font-size: 12px; line-height: 1.45;
+    overflow-wrap: anywhere;
+  }
+  .why span { display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+  .why.info { border-left-color: var(--changes); background: color-mix(in srgb, var(--changes) 9%, transparent); }
+  .more {
+    width: 100%; padding: 6px; background: none; border: 1px dashed var(--line); border-radius: 8px;
+    color: var(--muted); font-family: var(--mono); font-size: 11px; cursor: pointer;
+  }
+  .more:hover { color: var(--text); border-color: var(--muted); }
+
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
   @keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
   @media (prefers-reduced-motion: reduce) { .pulse, .chip.wait { animation: none; } }
@@ -177,6 +235,7 @@
   .file:hover { background: var(--card); color: var(--text); }
   .file.on { background: var(--card-hover); color: var(--text); }
   .file .rn { display: none; }
+  .files .keys { margin: 16px 8px 0; font-family: var(--mono); font-size: 10.5px; color: var(--faint); line-height: 1.7; }
   .file .v { width: 6px; height: 6px; border-radius: 50%; background: var(--faint); flex: none; }
   .v.good { background: var(--pass); } .v.warn { background: var(--changes); } .v.stop { background: var(--human); }
   .doc { overflow-y: auto; padding: 22px 28px 60px; min-width: 0; }
@@ -236,6 +295,11 @@
   }
   @media (max-width: 640px) {
     header { padding: 20px 16px 4px; }
+    .stats { padding: 12px 16px 0; }
+    .stat { flex: 1 1 28%; min-width: 0; }
+    .search { width: 100%; margin: 0; }
+    .blank { margin: 12px 16px 0; }
+    .files .keys { display: none; }
     .banner { margin: 12px 16px 0; }
     .board { grid-template-columns: 1fr; padding: 16px 16px 32px; }
     footer { padding: 0 16px 24px; }
@@ -257,13 +321,17 @@
   <h1>Software factory</h1>
   <div class="status" id="status">connecting…</div>
 </header>
+<div class="stats">
+  <div class="tiles" id="stats"></div>
+  <input class="search" id="q" type="search" placeholder="Filter jobs  ( / )" aria-label="Filter jobs">
+</div>
 <div id="banner"></div>
 <main class="board" id="board"></main>
 <footer>
   <span>/factory run</span>
   <span>/factory run &lt;n&gt;</span>
   <span>/factory &lt;anything&gt;</span>
-  <span id="totals"></span>
+  <span>chips: gate = checks.sh · code, ux, ui, sec = reviewers · dashed = not run yet</span>
 </footer>
 
 <div id="overlay">
@@ -296,6 +364,11 @@ const COLUMNS = [
 const STAGES = new Set(COLUMNS.flatMap((c) => c.stages))
 const LIVE = new Set(['intake', 'spec', 'build', 'gate', 'review', 'approve', 'merging'])
 const SHORT = { code: 'code', ux: 'ux', ui: 'ui', security: 'sec' }
+const DOING = {
+  intake: 'intake', spec: 'writing spec', build: 'building', gate: 'running checks',
+  review: 'in review', approve: 'approving', merging: 'merging',
+}
+const DONE_LIMIT = 6 // Done shows its newest few until asked for the rest
 
 const $ = (id) => document.getElementById(id)
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
@@ -307,6 +380,11 @@ const roundCache = new Map() // "<job>/<n>" -> verdicts of a finished round
 let openJobId = null
 let openPath = null
 let openText = null
+let openFiles = []
+let query = ''
+let showAllDone = false
+let concurrency = null // from config.json, for the slots tile
+const whyCache = new Map() // "<job>/<stage>/<round>" -> why a waiting job waits
 
 async function fetchText(url) {
   const res = await fetch(url, { cache: 'no-store' })
@@ -374,14 +452,47 @@ function links(job) {
   return out.join('')
 }
 
-function card(job, rounds) {
+function sectionOf(text, heading) {
+  const lines = text.split('\n')
+  const start = lines.findIndex((l) => l.trim() === `## ${heading}`)
+  if (start === -1) return null
+  let end = start + 1
+  while (end < lines.length && !/^##\s/.test(lines[end])) end++
+  return lines.slice(start + 1, end).join('\n').trim() || null
+}
+
+// Why a waiting job waits: the approver's question for you, or intake's for the author.
+async function whyWaiting(job) {
+  const human = job.stage === 'needs-human'
+  if (!human && job.stage !== 'needs-info') return null
+  const key = `${job.id}/${job.stage}/${job.round}`
+  if (whyCache.has(key)) return whyCache.get(key)
+  let text
+  try { text = await fetchText(`jobs/${job.id}/${human ? 'decision.md' : 'intake.md'}`) } catch { return null }
+  const body = human ? sectionOf(text, 'For the human') || sectionOf(text, 'Why') : sectionOf(text, 'Questions')
+  let why = null
+  if (body) {
+    const marker = /^\s*(\d+\.|[-*+])\s+/
+    // A lead-in such as "The builder is blocked:" takes the paragraph after it along.
+    const paras = body.split(/\n\s*\n/)
+    const para = (paras[0].trim().endsWith(':') && paras[1] ? paras[0] + '\n' + paras[1] : paras[0]).split('\n')
+    const items = para.filter((l) => marker.test(l))
+    why = items.length
+      ? items[0].replace(marker, '') + (items.length > 1 ? ` (+${items.length - 1} more)` : '')
+      : para.map((l) => l.trim()).join(' ')
+  }
+  whyCache.set(key, why)
+  return why
+}
+
+function card(job, rounds, why) {
   const live = LIVE.has(job.stage)
   const human = job.stage === 'needs-human'
   const done = job.stage === 'merged' || job.stage === 'rejected'
-  const [num, ...slug] = job.id.split('-')
   const flag = human ? '<span class="flag">your call</span>'
     : job.stage === 'needs-info' ? '<span class="flag wait">asked author</span>'
-    : job.stage === 'rejected' ? '<span class="flag wait">rejected</span>' : ''
+    : job.stage === 'rejected' ? '<span class="flag wait">rejected</span>'
+    : live ? `<span class="flag live">${DOING[job.stage]}</span>` : ''
   const risk = job.intake?.risk
   const meta = [
     risk ? `<span class="risk-${esc(risk)}">${esc(risk)}</span>` : '',
@@ -393,49 +504,88 @@ function card(job, rounds) {
              data-job="${esc(job.id)}" tabindex="0">
       <div class="card-top">
         ${live ? '<span class="pulse" aria-label="running"></span>' : ''}
-        <span class="num">${esc(num)} · ${esc(slug.join('-'))}</span>
+        <span class="num" title="${esc(job.id)}">${esc(job.id.split('-')[0])}</span>
         ${flag}
       </div>
       <p class="feature">${esc(job.title)}</p>
       <div class="links">${links(job)}</div>
+      ${why ? `<p class="why ${human ? '' : 'info'}"><span>${inline(why)}</span></p>` : ''}
       ${rounds.length ? `<div class="rounds">${rounds.join('')}</div>` : ''}
       <div class="meta">${meta}</div>
       ${human ? `<div class="hint">${job.pr ? `merge PR #${job.pr} to approve<br>` : ''}or give feedback: /factory &lt;anything&gt;</div>` : ''}
     </article>`
 }
 
+const matches = (job) => !query ||
+  `${job.id} ${job.title} #${job.issue} ${job.pr ? '#' + job.pr : ''} ${job.stage}`.toLowerCase().includes(query)
+
+function stats() {
+  const count = (stage) => jobs.filter((j) => j.stage === stage).length
+  const running = jobs.filter((j) => LIVE.has(j.stage)).length
+  const cost = jobs.reduce((sum, j) => sum + Number(j.cost_usd), 0)
+  const tile = (cls, value, label, on) =>
+    `<div class="stat ${cls} ${on ? 'on' : ''}"><b>${value}</b><span>${label}</span></div>`
+  return [
+    tile('live', running + (concurrency ? `<small> / ${esc(concurrency)}</small>` : ''), concurrency ? 'running · slots' : 'running', running),
+    tile('human', count('needs-human'), 'need you', count('needs-human')),
+    tile('info', count('needs-info'), 'asked author', count('needs-info')),
+    tile('', count('merged'), 'merged'),
+    tile('', count('rejected'), 'rejected'),
+    tile('', `$${cost.toFixed(2)}`, 'API-equivalent cost'),
+  ].join('')
+}
+
 async function render() {
   const problems = []
   const cards = new Map(COLUMNS.map((c) => [c, []]))
+  const shown = jobs.filter(matches)
   for (const job of jobs) {
     if (!STAGES.has(job.stage)) { problems.push(`Job ${job.id} has unknown stage "${job.stage}"`); continue }
+    if (!shown.includes(job)) continue
     const rounds = []
     for (let n = 1; n <= job.round; n++) rounds.push(roundRow(job, n, await roundVerdicts(job, n)))
-    cards.get(COLUMNS.find((c) => c.stages.includes(job.stage))).push(card(job, rounds))
+    cards.get(COLUMNS.find((c) => c.stages.includes(job.stage))).push(card(job, rounds, await whyWaiting(job)))
   }
   // Newest first within a column.
-  const html = COLUMNS.map((c) => `
+  const html = COLUMNS.map((c) => {
+    const all = cards.get(c).reverse()
+    const capped = c.cls === 'merged-col' && all.length > DONE_LIMIT
+    const list = capped && !showAllDone ? all.slice(0, DONE_LIMIT) : all
+    const more = !capped ? '' : `<button class="more" data-more>${showAllDone ? 'show fewer' : `show ${all.length - DONE_LIMIT} older`}</button>`
+    return `
     <section class="col ${c.cls || ''}">
       <div class="col-head">
         <h2>${c.label}</h2><span class="who">${c.who}</span>
-        <span class="count">${cards.get(c).length || ''}</span>
+        <span class="count">${all.length || ''}</span>
       </div>
-      ${cards.get(c).reverse().join('') || '<div class="empty">—</div>'}
-    </section>`).join('')
-  const banner = problems.map((p) => `<div class="banner">${esc(p)}</div>`).join('')
-  if (html + banner !== lastRender) {
-    lastRender = html + banner
+      ${list.join('') || '<div class="empty">—</div>'}${more}
+    </section>`
+  }).join('')
+  const blank = !jobs.length
+    ? 'No jobs yet. Label a GitHub issue <code>factory</code>, then run <code>/factory run</code> in Claude Code.'
+    : !shown.length ? `No job matches “${esc(query)}”.` : ''
+  const banner = problems.map((p) => `<div class="banner">${esc(p)}</div>`).join('') +
+    (blank ? `<div class="blank">${blank}</div>` : '')
+  const tiles = stats()
+  if (html + banner + tiles !== lastRender) {
+    lastRender = html + banner + tiles
     $('board').innerHTML = html
     $('banner').innerHTML = banner
+    $('stats').innerHTML = tiles
+    // Columns with jobs get the room; empty ones shrink.
+    $('board').style.setProperty('--cols',
+      COLUMNS.map((c) => (cards.get(c).length ? 'minmax(0, 1.6fr)' : 'minmax(0, .7fr)')).join(' '))
   }
-  const running = jobs.filter((j) => LIVE.has(j.stage)).length
-  const cost = jobs.reduce((sum, j) => sum + Number(j.cost_usd), 0)
-  $('totals').textContent = `${running} running · $${cost.toFixed(2)} API-equivalent`
+  const waiting = jobs.filter((j) => j.stage === 'needs-human').length
+  document.title = `${waiting ? `(${waiting}) ` : ''}Software Factory`
 }
 
 async function poll() {
   const status = $('status')
   try {
+    if (concurrency === null) {
+      try { concurrency = JSON.parse(await fetchText('config.json')).concurrency } catch { concurrency = 0 }
+    }
     jobs = await loadJobs()
     await render()
     if (openJobId) await refreshDrawer()
@@ -510,6 +660,8 @@ async function refreshDrawer() {
   const base = `jobs/${job.id}/`
   const files = sortFiles(await listFiles(base))
   if (!openPath || !files.includes(openPath)) openPath = files[0] || null
+  openFiles = files
+  setHash()
 
   let text = null
   if (openPath) {
@@ -532,7 +684,7 @@ async function refreshDrawer() {
     const t = tone(firstLines.get(base + f) || '')
     return `${head}<button class="file ${f === openPath ? 'on' : ''}" data-file="${esc(f)}">
       <span class="v ${t || ''}"></span>${name}</button>`
-  }).join('') || '<div class="empty">No files yet.</div>'
+  }).join('') + (files.length ? '<div class="keys">← → switch file<br>esc close</div>' : '<div class="empty">No files yet.</div>')
 
   if (text !== openText) {
     openText = text
@@ -540,9 +692,20 @@ async function refreshDrawer() {
   }
 }
 
-async function openDrawer(id) {
+// The open job and file live in the URL hash, so a reload or a shared link reopens them.
+function setHash() {
+  const hash = openJobId ? `#${openJobId}${openPath ? '/' + openPath : ''}` : location.pathname + location.search
+  history.replaceState(null, '', hash)
+}
+
+function openFromHash() {
+  const [id, ...path] = decodeURIComponent(location.hash.slice(1)).split('/')
+  if (id && jobs.some((j) => j.id === id)) openDrawer(id, path.join('/') || null)
+}
+
+async function openDrawer(id, path = null) {
   openJobId = id
-  openPath = null
+  openPath = path
   openText = undefined
   document.body.classList.add('open')
   try {
@@ -555,10 +718,12 @@ async function openDrawer(id) {
 function closeDrawer() {
   openJobId = null
   document.body.classList.remove('open')
+  setHash()
 }
 
 document.addEventListener('click', (e) => {
   if (e.target.closest('a')) return
+  if (e.target.closest('[data-more]')) { showAllDone = !showAllDone; return render() }
   const cardEl = e.target.closest('[data-job]')
   if (cardEl) return openDrawer(cardEl.dataset.job)
   const fileEl = e.target.closest('[data-file]')
@@ -572,6 +737,15 @@ document.addEventListener('click', (e) => {
 })
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') return closeDrawer()
+  const typing = e.target.matches?.('input, textarea')
+  if (e.key === '/' && !typing) { e.preventDefault(); return $('q').focus() }
+  if (openJobId && !typing && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+    const next = openFiles[openFiles.indexOf(openPath) + (e.key === 'ArrowRight' ? 1 : -1)]
+    if (!next) return
+    openPath = next
+    openText = undefined
+    return refreshDrawer()
+  }
   const cardEl = e.target.closest?.('[data-job]')
   if (cardEl && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); openDrawer(cardEl.dataset.job) }
 })
@@ -674,7 +848,9 @@ function markdown(src) {
   return html
 }
 
-poll()
+$('q').addEventListener('input', (e) => { query = e.target.value.trim().toLowerCase(); render() })
+poll().then(openFromHash)
+addEventListener('hashchange', openFromHash)
 setInterval(poll, POLL_MS)
 </script>
 </body>

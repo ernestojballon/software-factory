@@ -1,6 +1,7 @@
 {
   "concurrency": 3,
   "max_rounds": 3,
+  "checks_timeout_seconds": 1800,
   "base_branch": "main",
   "merge_method": "merge",
   "labels": {
@@ -19,7 +20,10 @@
   },
   "protected_paths": [
     "factory/checks.sh",
-    "factory/config.json"
+    "factory/config.json",
+    "factory/bin/*",
+    ".claude/agents/*",
+    ".claude/skills/factory/*"
   ],
   "ports": { "base": 5100, "step": 10 },
   "prices_usd_per_mtok": {
